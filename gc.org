@@ -1,0 +1,492 @@
+#+TITLE: Generational conservative garbage collector
+#+CATEGORY: Memory management
+#+STARTUP: showall
+
+* References
+
+** [[ftp://ftp.cs.utexas.edu/pub/garbage/bigsurv.ps][ftp://ftp.cs.utexas.edu/pub/garbage/bigsurv.ps]]
+
+** https://medium.com/@MartinCracauer/llvms-garbage-collection-facilities-and-sbcl-s-generational-gc-a13eedfb1b31
+
+* Memory layout
+
+** 0x50000000 read-only space
+
+** 0x50100000 static space
+
+*** Contains the symbols and functions required for interfacing with the C runtime.
+
+** 0x1000000000 dynamic space
+
+** 0x50300000 immobile space (fixedobj)
+
+** 0x52100000 immobile space (varyobj)
+
+* gc.lisp
+
+** gc is the user-facing entry point for the garbage collector
+
+"the default is to initiate a nursery collection, which may trigger a collection of older generations."
+
+** =sub-gc= does garbage collection.
+
+called mainly from (a) C runtime when it detects we should trigger gc or (b) Lisp via =gc=
+
+*** =collect_garbage(last_gen)=
+
+gc all generations newer than last_gen, raising the objects in each to the next older generation
+
+** =post-gc=
+
+* GC parameters
+
+#+BEGIN_SRC c
+/*
+ * GC parameters
+ */
+
+/* As usually configured, generations 0-5 are normal collected generations,
+   6 is pseudo-static (the objects in which are never moved nor reclaimed),
+   and 7 is scratch space used when collecting a generation without promotion,
+   wherein it is moved to generation 7 and back again.
+ */
+/*
+ * SCRATCH_GENERATION as we've defined it is kinda stupid because "<"
+ * doesn't do what you want. Other choices of value do, and since this an
+ * enum, it should be possible to change. Except it isn't because .. reasons.
+ * Here are some alternatives:
+ *  A: gen 0 through 6 remain as-is and SCRATCH becomes -1
+ *
+ *  B: 1 = nursery, 2 = older, ... up through "old" 6 which becomes the new 7;
+ *     and SCRATCH becomes 0. This is like alternative (A) but avoids negatives.
+ *
+ *  C: (probably the best)
+ *  generations are stored with an implied decimal and one bit of fraction
+ *  representing a half step so that:
+ *     #b0000 = 0, #b0001 = 1/2   | #b0010 = 1, #b0011 = 1 1/2
+ *     #b0100 = 2, #b0101 = 2 1/2 | #b0110 = 3, #b0111 = 3 1/2 ...
+ *  up to 6 1/2. When GCing without promotion, we'd raise each object by half
+ *  a generation, and then demote en masse, which is good because it makes the
+ *  scratch pages older than from_space but younger than the youngest root gen.
+ *
+ * Of course, you could try to solve all this by keeping the existing numbering,
+ * but expressing comparison "a < b" as either:
+ *     "logical_gen(a) < logical_gen(b)" // re-map numerically before compare
+ *  or "gen_lessp(a,b)" // just rename the comparator
+ *
+ * I generally prefer numeric comparison to just work, though we have a further
+ * difficulty that page_table[page].gen is not always the generation of an object,
+ * as when it is non-large and pinned. So the helpers might be needed anyway.
+ */
+#+END_SRC
+
+* =struct alloc_region=
+
+this data structure abstracts the data for an allocation region so that a single routine can be used for allocation and closing.
+
+this structure is referenced from the thread object.
+
+structure:
+
+| free_pointer |     end_addr | last_page |   start_addr |
+|--------------+--------------+-----------+--------------|
+| 0x1000546950 | 0x1000548000 |       168 | 0x1000540000 |
+
+free_pointer is advanced by gc_general_alloc to quickly allocate memory
+
+end_addr points to the byte after the last usable byte
+
+last_page = find_page_index((char*) end_addr - 1)
+
+** there are three global distinguished alloc_regions (besides the per-thread alloc_region)
+
+*** boxed_region
+
+*** unboxed_region
+
+*** code_region
+
+** documentation summary
+
+to allocate a from an alloc_region it suffices to update the free_pointer and ensure its new value does not exceed end_addr.
+
+each allocation region may start within a partly used page (recall that a page is 32K in SBCL parlance).
+
+during scavenging, objects will be moved into an allocation region and pointers will be updated accordingly.
+
+the memory managed by an alloc_region struct cannot be scavenged until it is closed.
+
+an alloc_region is closed by updating the PTEs (page table entries)
+
+#+BEGIN_SRC c
+/*
+ * To support quick and inline allocation, regions of memory can be
+ * allocated and then allocated from with just a free pointer and a
+ * check against an end address.
+ *
+ * Since objects can be allocated to spaces with different properties
+ * e.g. boxed/unboxed, generation, ages; there may need to be many
+ * allocation regions.
+ *
+ * Each allocation region may start within a partly used page. Many
+ * features of memory use are noted on a page wise basis, e.g. the
+ * generation; so if a region starts within an existing allocated page
+ * it must be consistent with this page.
+ *
+ * During the scavenging of the newspace, objects will be transported
+ * into an allocation region, and pointers updated to point to this
+ * allocation region. It is possible that these pointers will be
+ * scavenged again before the allocation region is closed, e.g. due to
+ * trans_list which jumps all over the place to cleanup the list. It
+ * is important to be able to determine properties of all objects
+ * pointed to when scavenging, e.g to detect pointers to the oldspace.
+ * Thus it's important that the allocation regions have the correct
+ * properties set when allocated, and not just set when closed. The
+ * region allocation routines return regions with the specified
+ * properties, and grab all the pages, setting their properties
+ * appropriately, except that the amount used is not known.
+ *
+ * These regions are used to support quicker allocation using just a
+ * free pointer. The actual space used by the region is not reflected
+ * in the pages tables until it is closed. It can't be scavenged until
+ * closed.
+ *
+ * When finished with the region it should be closed, which will
+ * update the page tables for the actual space used returning unused
+ * space. Further it may be noted in the new regions which is
+ * necessary when scavenging the newspace.
+ *
+ * Large objects may be allocated directly without an allocation
+ * region, the page table is updated immediately.
+ *
+ * Unboxed objects don't contain pointers to other objects and so
+ * don't need scavenging. Further they can't contain pointers to
+ * younger generations so WP is not needed. By allocating pages to
+ * unboxed objects the whole page never needs scavenging or
+ * write-protecting. */
+#+END_SRC
+
+#+BEGIN_SRC c
+/* Update the PTEs for the alloc_region. The region may be added to
+ * the new_areas.
+ *
+ * When done the alloc_region is set up so that the next quick alloc
+ * will fail safely and thus a new region will be allocated. Further
+ * it is safe to try to re-update the page table of this reset
+ * alloc_region.
+ *
+ * This is the internal implementation of ensure_region_closed(),
+ * and not to be invoked as the interface to closing a region.
+ */
+void
+gc_close_region(struct alloc_region *alloc_region, int page_type_flag)
+#+END_SRC
+
+the function =gc_alloc_with_region= is in charge of allocating memory using an alloc_region. in turn, this function is called by =alloc=, which is visible from the Lisp side in some architectures (e.g., alpha).
+
+* =alloc=
+
+#+BEGIN_SRC c
+lispobj AMD64_SYSV_ABI *alloc(sword_t nbytes)
+#+END_SRC
+
+retrieve the alloc_region from the current thread and invoke lisp_alloc with the BOXED_PAGE_FLAG on.
+
+* =lisp_alloc=
+
+#+BEGIN_SRC c
+lispobj *lisp_alloc(struct alloc_region *region, sword_t nbytes, int page_type_flag, struct thread *thread)
+#+END_SRC
+
+** update the runing maximum size of requested memory
+
+** attempt quick allocation by adding nbytes to region->free_pointer and verifying that it does not exceed region->end_addr
+
+** if quick allocation successful, return the old free_pointer and update the alloc_region structure. otherwise, continue
+
+** check to see if nbytes exceeds bytes_consed_between_gcs
+
+** if nbytes is sufficiently large to trigger auto-gc then turn on the current thread's GC_PENDING flag and turn interrupts off. This flag will be cleared from within SUB-GC on the Lisp-side (it might also be cleared from within interrupt.c)
+
+** call gc_alloc_with_region with quick_p = 0 (to close the region if what remains after allocation is small)
+
+** return the new pointer
+
+* =gc_alloc_with_region=
+
+#+BEGIN_SRC c
+void *gc_alloc_with_region(struct alloc_region *my_region, sword_t nbytes, int page_type_flag, int quick_p)
+#+END_SRC
+
+** if nbytes is too large, call gc_alloc_large
+
+** otherwise check whether the requested amount exceeds end_addr
+
+** if we can allocate then
+
+*** if quick_p = 0, then check to see if the remaining memory in the region is too small (i.e., < 32 bytes)
+
+**** if so, close the region by calling ensure_region_closed and allocate a new one with gc_alloc_new_region
+
+*** else update free_pointer and return its previous value
+
+** else
+
+*** ensure_region_closed
+
+*** gc_alloc_new_region
+
+*** tail call gc_alloc_with_region using the newly allocated region
+
+* =gc_alloc_large=
+
+* =free_pages_lock=
+
+lock preventing multiple threads from simultaneously allocating overlapping regions
+
+this lock must be acquired before accesses to the =generations= array or parts of =page_table= that could be accessed by other threads
+
+* =gc_close_region=
+
+#+BEGIN_SRC c
+/* Update the PTEs for the alloc_region. The region may be added to
+ * the new_areas.
+ *
+ * When done the alloc_region is set up so that the next quick alloc
+ * will fail safely and thus a new region will be allocated. Further
+ * it is safe to try to re-update the page table of this reset
+ * alloc_region.
+ *
+ * This is the internal implementation of ensure_region_closed(),
+ * and not to be invoked as the interface to closing a region.
+ */
+void gc_close_region(struct alloc_region *alloc_region, int page_type_flag)
+#+END_SRC
+
+** find the index of the first page in page_table corresponding to alloc_region
+
+** turn off the open region flag in the type field of the page structure corresponding to the first page of alloc_region
+
+** acquire free_pages_lock
+
+** if the region has been used to allocate some memory
+
+*** iterate over the pages in the alloc_region
+
+**** flip the OPEN_REGION_PAGE_FLAG bit in the type field of the corresponding page struct
+
+**** update a running sum of bytes used by the alloc_region
+
+**** update the next_page counter
+
+**** accumulate the total number of bytes allocated into the corresponding generation's counter.
+
+**** set alloc restart page to next_page-1
+
+*** the next_page counter points to the next page after the last page in the
+
+*** if BOXED_PAGE_FLAG
+
+**** add_new_area(first_page, orig_first_page_bytes_used, region_size)
+
+** else (the region was unused)
+
+*** reset page flags
+
+** iterate over pages from next_page to alloc_region->last_page resetting page flags
+
+** release free_pages_lock
+
+* =add_new_area=
+
+** TODO
+
+* =gc_alloc_new_region=
+
+#+BEGIN_SRC c
+static void gc_alloc_new_region(sword_t nbytes, int page_type_flag, struct alloc_region *alloc_region)
+#+END_SRC
+
+find a new region with at least nbytes of size
+
+#+BEGIN_SRC c
+/* Find a new region with room for at least the given number of bytes.
+ *
+ * It starts looking at the current generation's alloc_start_page. So
+ * may pick up from the previous region if there is enough space. This
+ * keeps the allocation contiguous when scavenging the newspace.
+ *
+ * The alloc_region should have been closed by a call to
+ * gc_close_region(), and will thus be in an empty state.
+ *
+ * To assist the scavenging functions write-protected pages are not
+ * used. Free pages should not be write-protected.
+ *
+ * It is critical to the conservative GC that the start of regions be
+ * known. To help achieve this only small regions are allocated at a
+ * time.
+ *
+ * During scavenging, pointers may be found to within the current
+ * region and the page generation must be set so that pointers to the
+ * from space can be recognized. Therefore the generation of pages in
+ * the region are set to gc_alloc_generation. To prevent another
+ * allocation call using the same pages, all the pages in the region
+ * are allocated, although they will initially be empty.
+ */
+#+END_SRC
+
+* =collect_garbage=
+
+takes a parameter last_gen that is periodic in the interval from 0 to PSEUDO_STATIC_GENERATION.
+
+** if the generation to be collected is the pseudo-static generation, then the garbage collection mode is to mark only (non-moving collection).
+
+* TODO =gc_init_region=
+
+* =garbage_collect_generation=
+
+#+BEGIN_SRC c
+/* Garbage collect a generation. If raise is 0 then the remains of the
+ * generation are not raised to the next generation. */
+#+END_SRC
+
+** If raise = 0, then scratch generation must be empty.
+
+** If generation < pseudo-static, then
+
+*** Set the from_space to be the current generation and the new_space to be either the scratch generation (=raise == 0=) or the next generation (=raise != 0=).
+
+** Else,
+
+*** Run full mark and sweep GC.
+
+** Scavenge for roots in:
+
+*** Control stack.
+
+*** Lisp functions attached to signal handlers.
+
+*** Binding stack.
+
+*** Heap (find object headers).
+
+*** Immobile space.
+
+*** New generation.
+
+** Free pages in old_space.
+
+* Static space
+
+** Non-collected storage. Meant mainly for purifying (when using cheneygc).
+
+** Allows the use of =make-static-vector=, for instance, which is used to store trampoline code for alien callbacks.
+
+** Useful for =purify= on platforms where cheneygc is in use.
+
+** Purifying GC
+
+*** From file:src/code/purify.lisp:
+
+#+BEGIN_SRC lisp
+(defun purify (&key root-structures environment-name)
+  "This function optimizes garbage collection by moving all currently live
+   objects into non-collected storage. ROOT-STRUCTURES is an optional list of
+   objects which should be copied first to maximize locality.
+
+   DEFSTRUCT structures defined with the (:PURE T) option are moved into
+   read-only storage, further reducing GC cost. List and vector slots of pure
+   structures are also moved into read-only storage.
+
+   ENVIRONMENT-NAME is unused.
+
+   This function is a no-op on platforms using the generational garbage
+   collector (x86, x86-64, ppc, arm, arm64)."
+  (declare (ignore environment-name))
+  (%purify (get-lisp-obj-address root-structures)
+           (get-lisp-obj-address nil)))
+#+END_SRC
+
+*** From the docstring of =save-lisp-and-die= in file:src/code/save.lisp:
+
+#+BEGIN_QUOTE
+[...] [D]o a purifying GC which moves all dynamically allocated objects into
+static space. This takes somewhat longer than the normal GC which is
+otherwise done, but it's only done once, and subsequent GC's will be done
+less often and will take less time in the resulting core file. See the PURIFY
+function. This parameter has no effect on platforms using the generational
+garbage collector.
+#+END_QUOTE
+
+* Immobile space
+
+** There is an SBCL feature called =:immobile-symbols= that stores all symbols in immobile space. This is useful unless a program uses symbols as data (e.g., Maxima).
+
+From file:src/code/symbol.lisp:
+
+#+BEGIN_SRC lisp
+;;; All symbols go into immobile space if #+immobile-symbols is enabled,
+;;; but not if disabled. The win with immobile space that is that all symbols
+;;; can be considered static from an addressing viewpoint, but GC'able.
+#+END_SRC
+
+** From file:base-target-features.lisp-expr:
+
+#+BEGIN_SRC lisp
+;; Build with support for an additional dynamic heap
+;; differing from the main dynamic heap in two ways:
+;;  1. it is guaranteed to reside below 4GB so that all pointers
+;;      into it fit in 32 bits. (Only an issue for >32 bit address space)
+;;  2. all objects therein are immovable, and space is reclaimed
+;;     by a mark-and-sweep collector.
+;; That combination of aspects potentially allows various efficiencies
+;; in code generation, especially for the x86-64 backend.
+;; The extra space has a fixed size which can only be changed by a rebuild,
+;; and out-of-space conditions are not easily preventable, so the space
+;; is sized rather generously to sidestep the issue.
+;; Additionally, it is assumed that for all objects in the immobile heap,
+;; speed of allocation of those objects is relatively unimportant.
+;; If unexpected performance regressions are observed,
+;; consider disabling this feature and reporting a bug.
+#+END_SRC
+
+#+BEGIN_SRC lisp
+;; Allocate most functions in the immobile space.
+;; Enabled by default if supported.
+;; The down-side of this feature is that the allocator is significantly
+;; slower than the allocator for movable code. If a particular application
+;; is performance-constrained by speed of creation of compiled functions
+;; (not including closures), the feature can be disabled.
+#+END_SRC
+
+** From file:NEWS:
+
+#+BEGIN_QUOTE
+  * enhancement: if #+immobile-symbols is in build-time *FEATURES* (not
+    enabled by default), then symbols will never be moved in memory
+    except by SAVE-LISP-AND-DIE. Immobility has helpful implications for
+    code generation as well as interaction with foreign routines.
+    This feature can only be enabled if #+immobile-space is enabled.
+#+END_QUOTE
+
+** The code in file:src/code/alloc.lisp handles Lisp-side allocation: direct allocation to static and immobile spaces.
+
+** See also the discussion in file:doc/internals-notes/non-moving-gc.
+
+* Example of garbage collection changing pointers under the hood:
+
+#+BEGIN_SRC lisp
+(defparameter *x* '(a b c d e))
+(sb-sys:int-sap (sb-kernel:get-lisp-obj-address *x*))
+; ==> #.(sb-sys:int-sap #X1001A29977)
+(defun allocate-garbage ()
+  (loop :for i :below 100000
+    :collect (format nil "~R" i)
+    :finally (return (values))))
+(allocate-garbage)
+(sb-sys:int-sap (sb-kernel:get-lisp-obj-address *x*))
+; ==> #.(sb-sys:int-sap #X10090468A7)
+(allocate-garbage)
+(sb-sys:int-sap (sb-kernel:get-lisp-obj-address *x*))
+; ==> #.(sb-sys:int-sap #X10099F68C7)
+#+END_SRC

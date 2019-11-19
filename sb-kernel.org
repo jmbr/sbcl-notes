@@ -1,0 +1,16 @@
+#+TITLE: SB-KERNEL
+#+STARTUP: showall
+
+* In file:src/code/stubs.lisp, there are declarations of low-level functions such as:
+
+** Manipulation of system area pointers (SAPs).
+
+** =get-header-data= and =set-header-data=
+
+** =widetag-of=
+
+** =current-fp=, =current-sp=, =stack-ref=, etc.
+
+** =%make-lisp-obj= and =get-lisp-obj-address=.
+
+* The actual definitions as VOPs appear in the relevant architecture-specific files.

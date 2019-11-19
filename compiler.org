@@ -1,0 +1,1008 @@
+#+TITLE: Compiler
+#+STARTUP: showall
+
+* How to compile a stand-alone form:
+
+#+BEGIN_SRC lisp
+  (sb-c:compile-in-lexenv '(lambda () (if (zerop (random 2)) t nil))
+                          (sb-kernel:make-null-lexenv)
+                          nil nil nil nil nil)
+#+END_SRC
+
+The function =compile-in-lexenv= invokes =%compile=, which in turn invokes =make-functional-from-toplevel-lambda= to break the code into components. All the blocks are sorted in depth-first order (DFO) and then the =%compile= function goes on to call =compile-component= on each component. This runs the IR1 and IR2 stages on the code (via, respectively, the functions =ir1-phases= and =%compile-component=). Throughout the IR2 passes executed via =ir2-convert= (which is called from =%compile-component=) the different VOPs are emitted according to the type of node within the block (i.e., =ref=, =combination=, =cif=, =bind=, =creturn=, =cset=, =cast=, =mv-combination=, =entry=, or =exit=).
+
+* The function =compile= in file:src/compiler/target-main.lisp is the user-facing entry point to the compiler.
+
+* The actual compilation is undertaken by the =%compile= function in file:src/compiler/main.lisp.
+
+#+BEGIN_SRC lisp
+;;; Compile LAMBDA-EXPRESSION into *COMPILE-OBJECT*, returning a
+;;; description of the result.
+;;;   * If *COMPILE-OBJECT* is a CORE-OBJECT, then write the function
+;;;     into core and return the compiled FUNCTION value.
+;;;   * If *COMPILE-OBJECT* is a fasl file, then write the function
+;;;     into the fasl file and return a dump handle.
+;;;
+;;; If NAME is provided, then we try to use it as the name of the
+;;; function for debugging/diagnostic information.
+(defun %compile (lambda-expression object
+                 &key
+                 name
+                 (path
+                  ;; This magical idiom seems to be the appropriate
+                  ;; path for compiling standalone LAMBDAs, judging
+                  ;; from the CMU CL code and experiment, so it's a
+                  ;; nice default for things where we don't have a
+                  ;; real source path (as in e.g. inside CL:COMPILE).
+                  '(original-source-start 0 0))
+                 &aux (*compile-object* object))
+;; ...
+)
+#+END_SRC
+
+* From CMU CL's internals documentation, we know that DFO stands for Depth-First Order and is an ordering of the flow graph determined depth-first traversal.
+
+* Definition of a component, from file:src/compiler/node.lisp:
+
+#+BEGIN_SRC lisp
+;;; A COMPONENT structure provides a handle on a connected piece of
+;;; the flow graph. Most of the passes in the compiler operate on
+;;; COMPONENTs rather than on the entire flow graph.
+#+END_SRC
+
+Additionally,
+
+#+BEGIN_SRC lisp
+;;; According to the CMU CL internals/front.tex, the reason for
+;;; separating compilation into COMPONENTs is
+;;;   to increase the efficiency of large block compilations. In
+;;;   addition to improving locality of reference and reducing the
+;;;   size of flow analysis problems, this allows back-end data
+;;;   structures to be reclaimed after the compilation of each
+;;;   component.
+#+END_SRC
+
+* TODO it would be nice to output the IR1 graph in Graphviz format and visualize it for typical forms (i.e., =defun=, =cond=, etc.).
+
+* Calling convention
+
+** Local calls.
+
+From file:src/compiler/locall.lisp:
+
+#+BEGIN_SRC lisp
+;;;; This file implements local call analysis. A local call is a
+;;;; function call between functions being compiled at the same time.
+;;;; If we can tell at compile time that such a call is legal, then we
+;;;; change the combination to call the correct lambda, mark it as
+;;;; local, and add this link to our call graph. Once a call is local,
+;;;; it is then eligible for let conversion, which places the body of
+;;;; the function inline.
+;;;;
+;;;; We cannot always do a local call even when we do have the
+;;;; function being called. Calls that cannot be shown to have legal
+;;;; arg counts are not converted.
+#+END_SRC
+
+** Full calls.
+
+From file:src/compiler/x86-64/call.lisp:
+
+#+BEGIN_SRC lisp
+;;;; full call
+;;;
+;;; There is something of a cross-product effect with full calls.
+;;; Different versions are used depending on whether we know the
+;;; number of arguments or the name of the called function, and
+;;; whether we want fixed values, unknown values, or a tail call.
+;;;
+;;; In full call, the arguments are passed creating a partial frame on
+;;; the stack top and storing stack arguments into that frame. On
+;;; entry to the callee, this partial frame is pointed to by FP.
+
+;;; This macro helps in the definition of full call VOPs by avoiding
+;;; code replication in defining the cross-product VOPs.
+;;;
+;;; NAME is the name of the VOP to define.
+;;;
+;;; NAMED is true if the first argument is an fdefinition object whose
+;;; definition is to be called.
+;;;
+;;; RETURN is either :FIXED, :UNKNOWN or :TAIL:
+;;; -- If :FIXED, then the call is for a fixed number of values, returned in
+;;;    the standard passing locations (passed as result operands).
+;;; -- If :UNKNOWN, then the result values are pushed on the stack, and the
+;;;    result values are specified by the Start and Count as in the
+;;;    unknown-values continuation representation.
+;;; -- If :TAIL, then do a tail-recursive call. No values are returned.
+;;;    The Old-Fp and Return-PC are passed as the second and third arguments.
+;;;
+;;; In non-tail calls, the pointer to the stack arguments is passed as
+;;; the last fixed argument. If Variable is false, then the passing
+;;; locations are passed as a more arg. Variable is true if there are
+;;; a variable number of arguments passed on the stack. Variable
+;;; cannot be specified with :TAIL return. TR variable argument call
+;;; is implemented separately.
+;;;
+;;; In tail call with fixed arguments, the passing locations are
+;;; passed as a more arg, but there is no new-FP, since the arguments
+;;; have been set up in the current frame.
+#+END_SRC
+
+* Reverse engineering a full call.
+
+Start with the following file named file:foobar.lisp:
+
+#+BEGIN_SRC lisp
+(defun my-function (x y z)
+  (another-function x)
+  (values y z))
+#+END_SRC
+
+Compile it using the command below to a trace file detailing the different blocks in IR1 and IR2 as well as the produced assembly.
+
+#+BEGIN_SRC lisp
+(compile-file "foobar.lisp" :trace-file "trace.log")
+#+END_SRC
+
+Take a quick look at the outcome:
+
+#+BEGIN_SRC asm
+.align  4
+SIMPLE-FUN-HEADER-WORD
+.SKIP   8
+   POP QWORD PTR [RBP+8]
+   CMP RCX, 6
+   JNE L1
+   LEA RSP, [RBP-16]
+   MOV RAX, RDI
+   MOV RDI, RSI
+   MOV [RBP-16], RAX
+   MOV [RBP-8], RDI
+   SUB RSP, 16
+   MOV ECX, 2
+   MOV [RSP], RBP
+   MOV RBP, RSP
+   CALL L0
+L0:
+   CMOVB RSP, RBX
+   MOV RAX, [RBP-16]
+   MOV RDI, [RBP-8]
+   MOV RDX, RAX
+   LEA RBX, [RBP+16]
+   MOV ECX, 4
+   MOV ESI, #x20100017              ; NIL
+   STC
+   MOV RSP, RBP
+   POP RBP
+   RET
+L1:
+   INT3 16                          ; Invalid argument count trap
+#+END_SRC
+
+In what follows, we inspect each of the VOPs and the corresponding assembly code.
+
+** xep-allocate-frame
+
+Recall that XEP = eXternal Entry Point.
+
+#+BEGIN_SRC lisp
+(define-vop (xep-allocate-frame)
+  (:info start-lab)
+  (:generator 1
+    (let ((nop-kind
+           (shiftf (sb-assem::asmstream-inter-function-padding sb-assem:*asmstream*)
+                   :nop)))
+      (emit-alignment n-lowtag-bits (if (eq nop-kind :nop) #x90 0)))
+    (emit-label start-lab)
+    ;; Skip space for the function header.
+    (inst simple-fun-header-word)
+    (inst .skip (* (1- simple-fun-insts-offset) n-word-bytes))
+    ;; The start of the actual code.
+    ;; Save the return-pc.
+    (popw rbp-tn (frame-word-offset return-pc-save-offset))))
+#+END_SRC
+
+The value of =return-pc-save-offset= is zero, as defined in file:src/compiler/x86-64/vm.lisp.
+
+Consider the standard prologue in the standard C ABI,
+#+BEGIN_SRC asm
+   PUSH RBP
+   MOV RBP, RSP
+#+END_SRC
+The return address is at RBP+8, the old (control stack) frame pointer is at RBP, and the empty slot is at RBP-8 (see Section 2.3 of sbcl-internals documentation). Stack-allocated local variables are placed from RBP-16 on.
+
+This is the layout of the stack at this point of the full call (i.e., after entering the function):
+
+#+BEGIN_SRC ditaa :file stack-0.png
++------------------------------+
+| ...                          |  |  Control stack grows downward
++------------------------------+  v
+| RBP + 16:                    |
++------------------------------+
+| RBP +  8:                    |
++------------------------------+
+| RBP +  0: RBP                |
++------------------------------+
+| RBP -  8: RIP                | <-- Current RSP
++------------------------------+
+| RBP - 16:                    |
++------------------------------+
+| RBP - 24:                    |
++------------------------------+
+| RBP - 32:                    |
++------------------------------+
+| ...                          |
++------------------------------+
+#+END_SRC
+
+#+BEGIN_SRC asm
+.align  4
+SIMPLE-FUN-HEADER-WORD
+.SKIP   8
+   POP QWORD PTR [RBP+8]
+   ;; ...
+L1:
+   INT3 16                          ; Invalid argument count trap
+#+END_SRC
+
+#+BEGIN_SRC ditaa :file stack-1.png
++------------------------------+
+| ...                          |  |  Control stack grows downward
++------------------------------+  v
+| RBP + 16:                    |
++------------------------------+
+| RBP +  8: RIP                |
++------------------------------+
+| RBP +  0: RBP                | <-- Current RSP
++------------------------------+
+| RBP -  8: RIP                |
++------------------------------+
+| RBP - 16:                    |
++------------------------------+
+| RBP - 24:                    |
++------------------------------+
+| RBP - 32:                    |
++------------------------------+
+| ...                          |
++------------------------------+
+#+END_SRC
+
+The =simple-fun-header-word= is defined in terms of =simple-fun-widetag= in file:src/compiler/generic/early-objdef.lisp as the word 0x00000031.
+
+The value of =sb-vm:simple-fun-insts-offset= is 2.
+
+** xep-verify-arg-count
+
+#+BEGIN_SRC lisp
+;; From src/compiler/call.lisp
+(define-vop (verify-arg-count)
+  (:policy :fast-safe)
+  (:args (nargs :scs (any-reg)))
+  (:arg-types positive-fixnum (:constant t) (:constant t))
+  (:info min max)
+  (:vop-var vop)
+  (:save-p :compute-only)
+  (:generator 3
+    ;; NOTE: copy-more-arg expects this to issue a CMP for min > 1
+    (let ((err-lab
+            (generate-error-code vop 'invalid-arg-count-error nargs)))
+      (flet ((check-min ()
+               (cond ((= min 1)
+                      (inst test nargs nargs)
+                      (inst jmp :e err-lab))
+                     ((plusp min)
+                      (inst cmp nargs (fixnumize min))
+                      (inst jmp :b err-lab)))))
+        (cond ((not min)
+               (if (zerop max)
+                   (inst test nargs nargs)
+                   (inst cmp nargs (fixnumize max)))
+               (inst jmp :ne err-lab))
+              (max
+               (check-min)
+               (inst cmp nargs (fixnumize max))
+               (inst jmp :a err-lab))
+              (t
+               (check-min)))))))
+
+;; From src/compiler/generic/utils.lisp
+(defun fixnumize (num)
+  (if (fixnump num)
+      (ash num n-fixnum-tag-bits)
+      (error "~W is too big for a fixnum." num)))
+#+END_SRC
+
+#+BEGIN_SRC asm
+   CMP RCX, 6
+   JNE L1
+#+END_SRC
+
+This checks that the passed number of arguments (stored in RCX) does not exceed 3. Note that 6 = #b110 is equal to 3 after we remove the 1-bit low-tag (see file:src/compiler/generic/early-vm.lisp).
+
+This is the layout of the stack at this point of the full call:
+
+** xep-setup-sp
+
+#+BEGIN_SRC lisp
+;; From src/compiler/x86-64/call.lisp
+(define-vop (xep-setup-sp)
+  (:generator 1
+    (emit-lea rsp-tn rbp-tn (- (* n-word-bytes
+                                  (- (sb-allocated-size 'stack)
+                                     sp->fp-offset))))))
+#+END_SRC
+
+SB stands for storage base. This concept encompasses registers, float registers, the stack, etc. (see file:src/compiler/x86-64/vm.lisp).
+
+The constant =sp->fp-offset= is set to 2 in file:src/compiler/x86-64/vm.lisp and
+
+#+BEGIN_SRC asm
+   LEA RSP, [RBP-16]
+#+END_SRC
+
+#+BEGIN_SRC ditaa :file stack-2.png
++------------------------------+
+| ...                          |  |  Control stack grows downward
++------------------------------+  v
+| RBP + 16:                    |
++------------------------------+
+| RBP +  8: RIP                |
++------------------------------+
+| RBP +  0: RBP                |
++------------------------------+
+| RBP -  8: RIP                |
++------------------------------+
+| RBP - 16:                    | <-- Current RSP
++------------------------------+
+| RBP - 24:                    |
++------------------------------+
+| RBP - 32:                    |
++------------------------------+
+| ...                          |
++------------------------------+
+#+END_SRC
+
+** VOP MOVE t2[RDI] :NORMAL => #:G2!3[RAX] :NORMAL
+
+#+BEGIN_SRC lisp
+;;;; the MOVE VOP
+(define-vop (move)
+  (:args (x :scs (any-reg descriptor-reg immediate) :target y
+            :load-if (not (location= x y))))
+  (:results (y :scs (any-reg descriptor-reg)
+               :load-if
+               (not (or (location= x y)
+                        (and (sc-is x any-reg descriptor-reg immediate)
+                             (sc-is y control-stack))))))
+  (:generator 0
+    (if (and (sc-is x immediate)
+             (sc-is y any-reg descriptor-reg control-stack))
+        (move-immediate y (encode-value-if-immediate x) temp-reg-tn)
+        (move y x))))
+#+END_SRC
+
+#+BEGIN_SRC asm
+   MOV RAX, RDI
+#+END_SRC
+
+** VOP MOVE t4[RSI] :NORMAL => #:G3!5[RDI] :NORMAL
+
+#+BEGIN_SRC asm
+   MOV RDI, RSI
+#+END_SRC
+
+** VOP MOVE-OPERAND Y!6[RAX] :NORMAL {SB-VM::STORE-STACK} => t7[S3] :SAVE-ONCE
+
+#+BEGIN_SRC lisp
+;; From src/compiler/pseudo-vops.lisp
+;;; Call a move function. Used for register save/restore and spilling.
+(define-vop (move-operand)
+  (:args (x))
+  (:results (y))
+  (:info name)
+  (:vop-var vop)
+  (:generator 0
+    (funcall (symbol-function name) vop x y)))
+
+;; From src/compiler/x86-64.lisp
+(define-move-fun (store-stack 5) (vop x y)
+  ((any-reg descriptor-reg) (control-stack)
+   (character-reg) (character-stack)
+   (sap-reg) (sap-stack)
+   (signed-reg) (signed-stack)
+   (unsigned-reg) (unsigned-stack))
+  (inst mov y x))
+#+END_SRC
+
+#+BEGIN_SRC asm
+   MOV [RBP-16], RAX
+   MOV [RBP-8], RDI
+#+END_SRC
+
+#+BEGIN_SRC ditaa :file stack-3.png
++------------------------------+
+| ...                          |  |  Control stack grows downward
++------------------------------+  v
+| RBP + 16:                    |
++------------------------------+
+| RBP +  8: RIP                |
++------------------------------+
+| RBP +  0: RBP                |
++------------------------------+
+| RBP -  8: RIP                |
++------------------------------+
+| RBP - 16: RAX                | <-- Current RSP
++------------------------------+
+| RBP - 24:                    |
++------------------------------+
+| RBP - 32:                    |
++------------------------------+
+| ...                          |
++------------------------------+
+#+END_SRC
+
+** VOP MOVE-OPERAND Z!8[RDI] :NORMAL {SB-VM::STORE-STACK} => t9[S2] :SAVE-ONCE
+
+#+BEGIN_SRC asm
+   MOV [RBP-8], RDI
+#+END_SRC
+
+#+BEGIN_SRC ditaa :file stack-4.png
++------------------------------+
+| ...                          |  |  Control stack grows downward
++------------------------------+  v
+| RBP + 16:                    |
++------------------------------+
+| RBP +  8: RIP                |
++------------------------------+
+| RBP +  0: RBP                |
++------------------------------+
+| RBP -  8: RDI                |
++------------------------------+
+| RBP - 16: RAX                | <-- Current RSP
++------------------------------+
+| RBP - 24:                    |
++------------------------------+
+| RBP - 32:                    |
++------------------------------+
+| ...                          |
++------------------------------+
+#+END_SRC
+
+** VOP ALLOCATE-FULL-CALL-FRAME {1} => t10[RSP] :NORMAL
+
+#+BEGIN_SRC lisp
+;; From src/compiler/x86-64/call.lisp
+;;; Allocate a partial frame for passing stack arguments in a full
+;;; call. NARGS is the number of arguments passed. We allocate at
+;;; least 2 slots, because the XEP noise is going to want to use them
+;;; before it can extend the stack.
+(define-vop (allocate-full-call-frame)
+  (:info nargs)
+  (:results (res :scs (any-reg)))
+  (:generator 2
+    (let ((fp-offset (* sp->fp-offset n-word-bytes))
+          (stack-size (* (max (if (> nargs register-arg-count)
+                                  nargs
+                                  0)
+                              (sb-c::sb-size (sb-or-lose 'stack)))
+                         n-word-bytes)))
+      (cond ((= fp-offset stack-size)
+             (inst sub rsp-tn stack-size)
+             (move res rsp-tn))
+            (t
+             (inst lea res (ea (- fp-offset) rsp-tn))
+             (inst sub rsp-tn stack-size))))))
+#+END_SRC
+
+If the number of arguments is smaller than =sb-vm::register-arg-count= (which is equal to 3 in x86-64), the arguments to a function call will be passed through registers. Otherwise, enough space is allocated on the stack to pass the arguments.
+
+#+BEGIN_SRC asm
+   SUB RSP, 16
+#+END_SRC
+
+#+BEGIN_SRC ditaa :file stack-5.png
++------------------------------+
+| ...                          |  |  Control stack grows downward
++------------------------------+  v
+| RBP + 16:                    |
++------------------------------+
+| RBP +  8: RIP                |
++------------------------------+
+| RBP +  0: RBP                |
++------------------------------+
+| RBP -  8: RDI                |
++------------------------------+
+| RBP - 16: RAX                |
++------------------------------+
+| RBP - 24:                    |
++------------------------------+
+| RBP - 32:                    | <-- Current RSP
++------------------------------+
+| ...                          |
++------------------------------+
+#+END_SRC
+
+** VOP CALL-NAMED t10[RSP] :NORMAL t12[RDX] :NORMAL {# 1 B 0 NIL}
+
+#+BEGIN_SRC lisp
+;; Macroexpanding DEFINE-FULL-CALL in src/compiler/x86-64/call.lisp, we get:
+(define-vop (call-named)
+  (:args (new-fp :scs (any-reg) :to (:argument 1))
+         (args :more t :scs (descriptor-reg)))
+  (:results (values :more t))
+  (:save-p t)
+  (:move-args :full-call)
+  (:vop-var vop)
+  (:node-var node)
+  (:info arg-locs nargs fun nvals step-instrumenting)
+  (:ignore arg-locs args rbx)
+  (:temporary (:sc unsigned-reg :offset rcx-offset :to :save) rcx)
+  (:temporary (:sc unsigned-reg :offset rbx-offset :from :result) rbx)
+  (:generator 31 (progn node)
+              (if (zerop nargs)
+                  (zeroize rcx)
+                  (inst mov rcx (fixnumize nargs)))
+              (storew rbp-tn new-fp (frame-word-offset ocfp-save-offset))
+              (move rbp-tn new-fp)
+              (when (and step-instrumenting (not (static-fdefn-offset fun)))
+                (emit-single-step-test)
+                (inst jmp :eq done)
+                (inst break single-step-around-trap))
+              done (note-this-location vop :call-site)
+              (let* ((fixup (make-fixup fun (if (static-fdefn-offset fun)
+                                                :static-call
+                                                :named-call)))
+                     (target (if (and (sb-c::code-immobile-p node)
+                                      (not step-instrumenting))
+                                 fixup
+                                 (progn (inst mov rax-tn fixup) rax-tn))))
+                (inst call target))
+              (default-unknown-values vop values nvals node)))
+
+;;; Emit code needed at the return-point from an unknown-values call
+;;; for a fixed number of values. Values is the head of the TN-REF
+;;; list for the locations that the values are to be received into.
+;;; Nvals is the number of values that are to be received (should
+;;; equal the length of Values).
+;;;
+;;; If 0 or 1 values are expected, then we just emit an instruction to
+;;; reset the SP (which will only be executed when other than 1 value
+;;; is returned.)
+;;;
+;;; In the general case we have to do three things:
+;;;  -- Default unsupplied register values. This need only be done
+;;;     when a single value is returned, since register values are
+;;;     defaulted by the called in the non-single case.
+;;;  -- Default unsupplied stack values. This needs to be done whenever
+;;;     there are stack values.
+;;;  -- Reset SP. This must be done whenever other than 1 value is
+;;;     returned, regardless of the number of values desired.
+(defun default-unknown-values (vop values nvals node)
+  (declare (type (or tn-ref null) values)
+           (type unsigned-byte nvals))
+  (let ((type (sb-c::basic-combination-derived-type node)))
+    (cond
+      ((<= nvals 1)
+       (note-this-location vop :single-value-return)
+       (cond
+         ((<= (sb-kernel:values-type-max-value-count type)
+              register-arg-count)
+          (when (and (named-type-p type)
+                     (eq nil (named-type-name type)))
+            ;; The function never returns, it may happen that the code
+            ;; ends right here leavig the :SINGLE-VALUE-RETURN note
+            ;; dangling. Let's emit a NOP.
+            (inst nop)))
+         ((not (sb-kernel:values-type-may-be-single-value-p type))
+          (inst mov rsp-tn rbx-tn))
+         (t
+          (inst cmov :c rsp-tn rbx-tn))))
+      ((<= nvals register-arg-count)
+       (note-this-location vop :unknown-return)
+       (when (sb-kernel:values-type-may-be-single-value-p type)
+         (let ((regs-defaulted (gen-label)))
+           (inst jmp :c regs-defaulted)
+           ;; Default the unsupplied registers.
+           (let* ((2nd-tn-ref (tn-ref-across values))
+                  (2nd-tn (tn-ref-tn 2nd-tn-ref))
+                  (2nd-tn-live (neq (tn-kind 2nd-tn) :unused)))
+             (when 2nd-tn-live
+               (inst mov 2nd-tn nil-value))
+             (when (> nvals 2)
+               (loop
+                 for tn-ref = (tn-ref-across 2nd-tn-ref)
+                 then (tn-ref-across tn-ref)
+                 for count from 2 below register-arg-count
+                 unless (eq (tn-kind (tn-ref-tn tn-ref)) :unused)
+                 do
+                 (inst mov :dword (tn-ref-tn tn-ref)
+                       (if 2nd-tn-live 2nd-tn nil-value)))))
+           (inst mov rbx-tn rsp-tn)
+           (emit-label regs-defaulted)))
+       (when (< register-arg-count
+                (sb-kernel:values-type-max-value-count type))
+         (inst mov rsp-tn rbx-tn)))
+      (t
+       (collect ((defaults))
+         (let ((default-stack-slots (gen-label))
+               (used-registers
+                 (loop for i from 1 below register-arg-count
+                       for tn = (tn-ref-tn (setf values (tn-ref-across values)))
+                       unless (eq (tn-kind tn) :unused)
+                       collect tn
+                       finally (setf values (tn-ref-across values))))
+               (used-stack-slots-p
+                 (loop for ref = values then (tn-ref-across ref)
+                       while ref
+                       thereis (neq (tn-kind (tn-ref-tn ref)) :unused))))
+          (assemble ()
+            (note-this-location vop :unknown-return)
+            ;; If it returned exactly one value the registers and the
+            ;; stack slots need to be filled with NIL.
+            (cond (used-stack-slots-p
+                   (inst jmp :nc default-stack-slots))
+                  (t
+                   (inst jmp :c regs-defaulted)
+                   (loop for null = nil-value then (car used-registers)
+                         for reg in used-registers
+                         do (inst mov :dword reg null))
+                   (move rbx-tn rsp-tn)
+                   (inst jmp defaulting-done)))
+            REGS-DEFAULTED
+            (do ((i register-arg-count (1+ i))
+                 (val values (tn-ref-across val)))
+                ((null val))
+              (let ((tn (tn-ref-tn val)))
+                (unless (eq (tn-kind tn) :unused)
+                  (let ((default-lab (gen-label)))
+                    (defaults (cons default-lab tn))
+                    ;; Note that the max number of values received
+                    ;; is assumed to fit in a :dword register.
+                    (inst cmp :dword rcx-tn (fixnumize i))
+                    (inst jmp :be default-lab)
+                    (sc-case tn
+                      (control-stack
+                       (loadw r11-tn rbx-tn (frame-word-offset (+ sp->fp-offset i)))
+                       (inst mov tn r11-tn))
+                      (t
+                       (loadw tn rbx-tn (frame-word-offset (+ sp->fp-offset i)))))))))
+            DEFAULTING-DONE
+            (move rsp-tn rbx-tn)
+            (let ((defaults (defaults)))
+              (when defaults
+                (assemble (:elsewhere)
+                  (emit-label default-stack-slots)
+                  (loop for null = nil-value then (car used-registers)
+                        for reg in used-registers
+                        do (inst mov :dword reg null))
+                  (move rbx-tn rsp-tn)
+                  (dolist (default defaults)
+                    (emit-label (car default))
+                    (inst mov (cdr default) nil-value))
+                  (inst jmp defaulting-done)))))))))))
+#+END_SRC
+
+Thus the =call-named= VOP stores the (fixnumized) number of arguments in RCX, allocates a new stack frame, and issues the CALL instruction:
+
+#+BEGIN_SRC asm
+   MOV ECX, 2
+   MOV [RSP], RBP
+   MOV RBP, RSP
+   CALL 0x????????
+   CMOVB RSP, RBX
+#+END_SRC
+
+The 0x???????? address for CALL represents a so-called fixup that is to be replaced by the address of the user-defined function =other-function= when =sb-fasl:load= interprets the FASL file. The actual value of this address in the FASL is zero but the file contains enough information so that the correct address can be overwritten at runtime.
+
+Before CALL, the stack looks like this:
+
+#+BEGIN_SRC ditaa :file stack-6.png
++------------------------------+
+| ...                          |  |  Control stack grows downward
++------------------------------+  v
+| RBP + 48:                    |
++------------------------------+
+| RBP + 40: RIP                |
++------------------------------+
+| RBP + 32: RBP                |
++------------------------------+
+| RBP + 24: RDI                |
++------------------------------+
+| RBP + 16: RAX                |
++------------------------------+
+| RBP +  8:                    |
++------------------------------+
+| RBP -  0: RBP                | <-- Current RSP
++------------------------------+
+| RBP -  8:                    |
++------------------------------+
+| ...                          |
++------------------------------+
+#+END_SRC
+
+** VOP MOVE-OPERAND t7[S3] :SAVE-ONCE {SB-VM::LOAD-STACK} => Y!6[RAX] :NORMAL
+
+** VOP MOVE-OPERAND t9[S2] :SAVE-ONCE {SB-VM::LOAD-STACK} => Z!8[RDI] :NORMAL
+
+** VOP MOVE Y!6[RAX] :NORMAL => t13[RDX] :NORMAL
+
+** VOP RETURN t14[S1] :DEBUG-ENVIRONMENT t15[S0] :DEBUG-ENVIRONMENT t16[RDX] :NORMAL t17[RDI] :NORMAL {2}
+
+#+BEGIN_SRC lisp
+;; From src/compiler/x86-64/call.lisp
+;;; Do unknown-values return of a fixed (other than 1) number of
+;;; values. The VALUES are required to be set up in the standard
+;;; passing locations. NVALS is the number of values returned.
+;;;
+;;; Basically, we just load RCX with the number of values returned and
+;;; RBX with a pointer to the values, set RSP to point to the end of
+;;; the values, and jump directly to return-pc.
+(define-vop (return)
+  (:args (old-fp)
+         (return-pc :to (:eval 1))
+         (values :more t))
+  (:ignore values)
+  (:info nvals)
+  ;; In the case of other than one value, we need these registers to
+  ;; tell the caller where they are and how many there are.
+  (:temporary (:sc unsigned-reg :offset rbx-offset) rbx)
+  (:temporary (:sc unsigned-reg :offset rcx-offset) rcx)
+  ;; We need to stretch the lifetime of return-pc past the argument
+  ;; registers so that we can default the argument registers without
+  ;; trashing return-pc.
+  (:temporary (:sc unsigned-reg :offset (first *register-arg-offsets*)
+                   :from :eval) a0)
+  (:temporary (:sc unsigned-reg :offset (second *register-arg-offsets*)
+                   :from :eval) a1)
+  (:temporary (:sc unsigned-reg :offset (third *register-arg-offsets*)
+                   :from :eval) a2)
+
+  (:generator 6
+    (check-ocfp-and-return-pc old-fp return-pc)
+    (when (= nvals 1)
+      ;; This is handled in RETURN-SINGLE.
+      (error "nvalues is 1"))
+    ;; Establish the values pointer and values count.
+    (inst lea rbx (ea (* sp->fp-offset n-word-bytes) rbp-tn))
+    (if (zerop nvals)
+        (zeroize rcx) ; smaller
+        (inst mov rcx (fixnumize nvals)))
+    ;; Pre-default any argument register that need it.
+    (when (< nvals register-arg-count)
+      (let* ((arg-tns (nthcdr nvals (list a0 a1 a2)))
+             (first (first arg-tns)))
+        (inst mov first nil-value)
+        (dolist (tn (cdr arg-tns))
+          (inst mov tn first))))
+    ;; Set the multiple value return flag.
+    (inst stc)
+    ;; And away we go. Except that return-pc is still on the
+    ;; stack and we've changed the stack pointer. So we have to
+    ;; tell it to index off of RBX instead of RBP.
+    (cond ((<= nvals register-arg-count)
+           (inst mov rsp-tn rbp-tn)
+           (inst pop rbp-tn)
+           (inst ret))
+          (t
+           ;; Some values are on the stack after RETURN-PC and OLD-FP,
+           ;; can't return normally and some slots of the frame will
+           ;; be used as temporaries by the receiver.
+           ;;
+           ;; Clear as much of the stack as possible, but not past the
+           ;; old frame address.
+           (inst lea rsp-tn
+                 (ea (frame-byte-offset (1- nvals)) rbp-tn))
+           (move rbp-tn old-fp)
+           (inst push (ea (frame-byte-offset
+                           (+ sp->fp-offset (tn-offset return-pc)))
+                          rbx))
+           (inst ret)))))
+#+END_SRC
+
+The key point above is stated in the following quote:
+
+#+BEGIN_QUOTE
+Basically, we just load RCX with the number of values returned and RBX with a
+pointer to the values, set RSP to point to the end of the values, and jump
+directly to return-pc.
+#+END_QUOTE
+
+The produced assembly is:
+
+#+BEGIN_SRC asm
+   LEA RBX, [RBP+16]
+   MOV ECX, 4
+   MOV ESI, #x20100017              ; NIL
+   STC
+   MOV RSP, RBP
+   POP RBP
+   RET
+#+END_SRC
+
+The RCX register stores the number of values returned (2 in this case ---which is 4 after fixnumization).
+
+* Additional debugging special variables:
+
+** =sb-c::*debug-tlf-queueing*= <-- =t=
+
+** =*print-level*= <-- =2=
+
+* VOPs
+
+** The =sb-c:define-vop= macro is used to define VOPs.
+
+#+BEGIN_SRC lisp
+;;; Define the symbol NAME to be a Virtual OPeration in the compiler.
+;;; If specified, INHERITS is the name of a VOP that we default
+;;; unspecified information from. Each SPEC is a list beginning with a
+;;; keyword indicating the interpretation of the other forms in the
+;;; SPEC:
+;;;
+;;; :ARGS {(Name {Key Value}*)}*
+;;; :RESULTS {(Name {Key Value}*)}*
+;;;     The Args and Results are specifications of the operand TNs passed
+;;;     to the VOP. If there is an inherited VOP, any unspecified options
+;;;     are defaulted from the inherited argument (or result) of the same
+;;;     name. The following operand options are defined:
+;;;
+;;;     :SCs (SC*)
+;;;         :SCs specifies good SCs for this operand. Other SCs will
+;;;         be penalized according to move costs. A load TN will be
+;;;         allocated if necessary, guaranteeing that the operand is
+;;;         always one of the specified SCs.
+;;;
+;;;     :LOAD-TN Load-Name
+;;;         Load-Name is bound to the load TN allocated for this
+;;;         operand, or to NIL if no load TN was allocated.
+;;;
+;;;     :LOAD-IF EXPRESSION
+;;;         Controls whether automatic operand loading is done.
+;;;         EXPRESSION is evaluated with the fixed operand TNs bound.
+;;;         If EXPRESSION is true, then loading is done and the variable
+;;;         is bound to the load TN in the generator body. Otherwise,
+;;;         loading is not done, and the variable is bound to the actual
+;;;         operand.
+;;;
+;;;     :MORE T-or-NIL
+;;;         If specified, NAME is bound to the TN-REF for the first
+;;;         argument or result following the fixed arguments or results.
+;;;         A :MORE operand must appear last, and cannot be targeted or
+;;;         restricted.
+;;;
+;;;     :TARGET Operand
+;;;         This operand is targeted to the named operand, indicating a
+;;;         desire to pack in the same location. Not legal for results.
+;;;
+;;;     :FROM Time-Spec
+;;;     :TO Time-Spec
+;;;         Specify the beginning or end of the operand's lifetime.
+;;;         :FROM can only be used with results, and :TO only with
+;;;         arguments. The default for the N'th argument/result is
+;;;         (:ARGUMENT N)/(:RESULT N). These options are necessary
+;;;         primarily when operands are read or written out of order.
+;;;
+;;; :CONDITIONAL [Condition-descriptor+]
+;;;     This is used in place of :RESULTS with conditional branch VOPs.
+;;;     There are no result values: the result is a transfer of control.
+;;;     The target label is passed as the first :INFO arg. The second
+;;;     :INFO arg is true if the sense of the test should be negated.
+;;;     A side effect is to set the PREDICATE attribute for functions
+;;;     in the :TRANSLATE option.
+;;;
+;;;     If some condition descriptors are provided, this is a flag-setting
+;;;     VOP. Descriptors are interpreted in an architecture-dependent
+;;;     manner. See the BRANCH-IF VOP in $ARCH/pred.lisp.
+;;;
+;;; :TEMPORARY ({Key Value}*) Name*
+;;;     Allocate a temporary TN for each Name, binding that variable to
+;;;     the TN within the body of the generators. In addition to :TARGET
+;;;     (which is is the same as for operands), the following options are
+;;;     defined:
+;;;
+;;;     :SC SC-Name
+;;;     :OFFSET SB-Offset
+;;;         Force the temporary to be allocated in the specified SC
+;;;         with the specified offset. Offset is evaluated at
+;;;         macroexpand time. If Offset is omitted, the register
+;;;         allocator chooses a free location in SC. If both SC and
+;;;         Offset are omitted, then the temporary is packed according
+;;;         to its primitive type.
+;;;
+;;;     :FROM Time-Spec
+;;;     :TO Time-Spec
+;;;         Similar to the argument/result option, this specifies the
+;;;         start and end of the temporaries' lives. The defaults are
+;;;         :LOAD and :SAVE, i.e. the duration of the VOP. The other
+;;;         intervening phases are :ARGUMENT, :EVAL and :RESULT.
+;;;         Non-zero sub-phases can be specified by a list, e.g. by
+;;;         default the second argument's life ends at (:ARGUMENT 1).
+;;;
+;;; :GENERATOR Cost Form*
+;;;     Specifies the translation into assembly code. Cost is the
+;;;     estimated cost of the code emitted by this generator. The body
+;;;     is arbitrary Lisp code that emits the assembly language
+;;;     translation of the VOP. An ASSEMBLE form is wrapped around
+;;;     the body, so code may be emitted by using the local INST macro.
+;;;     During the evaluation of the body, the names of the operands
+;;;     and temporaries are bound to the actual TNs.
+;;;
+;;; :INFO Name*
+;;;     Define some magic arguments that are passed directly to the code
+;;;     generator. The corresponding trailing arguments to VOP or
+;;;     %PRIMITIVE are stored in the VOP structure. Within the body
+;;;     of the generators, the named variables are bound to these
+;;;     values. Except in the case of :CONDITIONAL VOPs, :INFO arguments
+;;;     cannot be specified for VOPS that are the direct translation
+;;;     for a function (specified by :TRANSLATE).
+;;;
+;;; :IGNORE Name*
+;;;     Causes the named variables to be declared IGNORE in the
+;;;     generator body.
+;;;
+;;; :VARIANT Thing*
+;;; :VARIANT-VARS Name*
+;;;     These options provide a way to parameterize families of VOPs
+;;;     that differ only trivially. :VARIANT makes the specified
+;;;     evaluated Things be the "variant" associated with this VOP.
+;;;     :VARIANT-VARS causes the named variables to be bound to the
+;;;     corresponding Things within the body of the generator.
+;;;
+;;; :VARIANT-COST Cost
+;;;     Specifies the cost of this VOP, overriding the cost of any
+;;;     inherited generator.
+;;;
+;;; :NOTE {String | NIL}
+;;;     A short noun-like phrase describing what this VOP "does", i.e.
+;;;     the implementation strategy. If supplied, efficiency notes will
+;;;     be generated when type uncertainty prevents :TRANSLATE from
+;;;     working. NIL inhibits any efficiency note.
+;;;
+;;; :ARG-TYPES    {* | PType | (:OR PType*) | (:CONSTANT Type)}*
+;;; :RESULT-TYPES {* | PType | (:OR PType*)}*
+;;;     Specify the template type restrictions used for automatic
+;;;     translation. If there is a :MORE operand, the last type is the
+;;;     more type. :CONSTANT specifies that the argument must be a
+;;;     compile-time constant of the specified Lisp type. The constant
+;;;     values of :CONSTANT arguments are passed as additional :INFO
+;;;     arguments rather than as :ARGS.
+;;;
+;;; :TRANSLATE Name*
+;;;     This option causes the VOP template to be entered as an IR2
+;;;     translation for the named functions.
+;;;
+;;; :POLICY {:SMALL | :SMALL-SAFE | :FAST | :SAFE | :FAST-SAFE}
+;;;     Specifies the policy under which this VOP is the best translation.
+;;;
+;;; :GUARD Form
+;;;     Specifies a Form that is evaluated in the global environment.
+;;;     If form returns NIL, then emission of this VOP is prohibited
+;;;     even when all other restrictions are met.
+;;;
+;;; :VOP-VAR Name
+;;; :NODE-VAR Name
+;;;     In the generator, bind the specified variable to the VOP or
+;;;     the Node that generated this VOP.
+;;;
+;;; :SAVE-P {NIL | T | :COMPUTE-ONLY | :FORCE-TO-STACK}
+;;;     Indicates how a VOP wants live registers saved.
+;;;
+;;; :MOVE-ARGS {NIL | :FULL-CALL | :LOCAL-CALL | :KNOWN-RETURN}
+;;;     Indicates if and how the more args should be moved into a
+;;;     different frame.
+#+END_SRC
+
+* Intersperse disassembly with source code:
+
+#+BEGIN_SRC lisp
+(setf *disassemble-annotate* t)
+#+END_SRC
+
+* The registers used to pass arguments in x86-64 systems are defined in file:src/compiler/x86-64/x86-64/vm.lisp. These are RDX, RDI, and RSI (only three and in this particular order).
+
+By contrast, the System V ABI allows RDI, RSI, RDX, RCX, R8, and R9 as specified in https://github.com/hjl-tools/x86-psABI/wiki/X86-psABI.
+
+* The function =multiple-value-call=, defined in file:src/compiler/ir1-translators.lisp is responsible for calling code. The implementations of both =funcall= and =apply= invoke =multiple-value-call= in the end.
+
+** TODO Study =multiple-value-call= thoroughly.

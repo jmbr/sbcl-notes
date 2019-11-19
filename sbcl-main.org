@@ -1,0 +1,205 @@
+#+TITLE: Walk-through sbcl_main
+#+CATEGORY: Runtime
+#+STARTUP: showall
+
+* =allocate_hardwired_spaces=
+
+** 0x50000000 read_only_space
+
+** 0x50100000 static_space
+
+** 0x50200000 linkage_table_space
+
+* =interrupt_init=
+
+** Deferrable signals: SIGHUP SIGINT SIGTERM SIGQUIT SIGPIPE SIGALRM SIGURG SIGTSTP SIGCHLD SIGIO SIGPOLL SIGXCPU SIGXFSZ SIGVTALRM SIGPROF SIGWINCH
+
+** Blockable signals: deferrable signals + (possibly a SIGSTOP for GC if the platform supports it)
+
+** Iterate over the array interrupt_handlers and set the default handler for every signal.
+
+** Call =undoably_install_low_level_interrupt_handler= for SIGABRT
+
+*** Install =sigabrt_handler= masking blockable signals and enabling the =SA_SIGINFO=, =SA_RESTART=, =SA_NODEFER=, and =SA_ONSTACK= flags.
+
+* =block_blockable_signals=
+
+** Call =sigprocmask= to ensure the blockable signals (see above) are blocked.
+
+* Find out sizes of several memory regions
+
+** =dynamic_space_size = 0x40000000=
+
+** =thread_control_stack_size = 0x200000=
+
+* =os_init=
+
+** set the value of os_vm_pagesize to 32K.
+
+* =allocate_lisp_dynamic_space(have_hardwired_spaces = 1)=
+
+** This should call allocate_hardwired_spaces if it hadn't been called earlier.
+
+* =gc_init=
+
+** asserts that the C compiler stores flags in the expected way.
+
+* =globals_init=
+
+** =current_control_frame_pointer = 0=
+
+** =foreign_function_call_active = 0=
+
+* =load_core_file=
+
+** A core contains a directory of =ndir_entry= structs:
+
+*** =identifier=
+
+*** =nwords=
+
+*** =data_page=
+
+*** =address=
+
+*** =page_count=
+
+** =process_directory=
+
+*** Read directory entries from the core file and populate an array of spaces containing
+
+| identifier | space                     | desired_size |    length |         base | pfree_pointer                |
+|------------+---------------------------+--------------+-----------+--------------+------------------------------|
+|          0 | blank                     |            0 |         0 |            0 | NULL                         |
+|          1 | dynamic core space        |   0x40000000 | 0x17f0000 | 0x1000000000 | NULL                         |
+|          2 | static core space         |            0 |     0x800 |   0x50100000 | static_space_free_pointer    |
+|          3 | read only core space      |            0 |         0 |   0x50000000 | read_only_space_free_pointer |
+|          4 | immobile space (fixedobj) |    0xa000001 |  0x148000 |   0x50300000 | fixedobj_free_pointer        |
+|          5 | immobile space (varyobj)  |            1 |  0xa88000 |   0x52100000 | varyobj_free_pointer         |
+
+*** The =*_free_pointer= global variables are initially NULL pointers but their values are updated here so that, when dereferenced, they will point to the end of the corresponding space.
+
+*** Populate =ndir_entry= structures.
+
+|   | identifier | space              |   nwords | data_page |      address | page_count |
+|---+------------+--------------------+----------+-----------+--------------+------------|
+|   |          2 | static core space  |      162 |         0 | 0x0050100000 |          1 |
+|   |          1 | dynamic core space | 0x2fe000 |         1 | 0x1000000000 |        766 |
+|   |            |                    |          |           |              |            |
+|   |            |                    |          |           |              |            |
+
+*** The core spaces are mapped from the core file into the specified addresses.
+
+*** =immobile_space_coreparse=
+
+Set the characteristics of each used page at image startup time.
+
+Immobile space is a set of pages of memory for objects that are statically placed (not moved by the GC) but are subject to be garbage-collected nevertheless.
+
+There are two types of immobile spaces: one for objects that are fixed in size (fixedobj) and another for objects whose size can vary (varyobj).
+
+**** =gc_init_immobile=
+
+***** set up immobile spaces
+
+
+** find initial_function inside the core file.
+
+** gc_load_corefile_ptes()
+
+Read corefile page table entries from file.
+
+*** gc_allocate_ptes()
+
+**** page_table_pages: number of pages needed for the dynamic space (32768 pages correspond to 1G of dynamic space)
+
+**** nursery size is set to be the maximum of either 5% of total dynamic space or 1M
+
+**** the nursery size is also the same number of bytes consed between GCs
+
+**** allocate 1+page_table_pages structs of type page. the extra page serves as a sentinel.
+
+struct page:
+
+| type               | name                    | description                                                                                                                                                                                  |
+|--------------------+-------------------------+----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| int                | scan_start_offset_      | offset from the first byte of some object in memory to the start of the page (ideally 0)                                                                                                     |
+| page_bytes_t       | bytes_used_             | number of bytes of this page that are in use. must be zero for unallocated pages                                                                                                             |
+| unsigned:5         | type                    | 0000 free, ?001 boxed data, ?010 unboxed data, ?011 code, 1??? open region. the high bit indicates that the page holds either a part or the entirety of a single object and no other objects |
+| unsigned:1         | write_protected         | set when page is write-protected. if a write-protected page is written into, an exception is caught, and the flag is cleared                                                                 |
+| unsigned:1         | write_protected_cleared | set when the write_protected flag is cleared after catching an exception.                                                                                                                    |
+| unsigned:1         | pinned                  | set if this page should not be moved during a GC                                                                                                                                             |
+| generation_index_t | gen                     | generation that this page belongs to. allows the space of an object to be easily determined.                                                                                                 |
+
+the values of scan_start_offset_ and bytes_used_ are zero for the sentinel.
+
+an array of page structures allows SBCL to map between an address and its page structure
+
+**** weabobj_init()
+
+***** hopscotch_init()
+
+****** prepare for use of hash tables that use the hopscotch algorithm
+
+***** hopscotch_create()
+
+****** create a hash table for weak objects
+
+**** hopscotch_create()
+
+***** create a hash table for pinned objects
+
+**** initialize generations
+
+there are seven generations. generations 0-5 are "normal" while generation 6 is called pseudo-static
+
+***** each generation's state is represented by
+
+struct generation
+
+| type         | name                           | description                                                                                                 | default value |
+|--------------+--------------------------------+-------------------------------------------------------------------------------------------------------------+---------------|
+| os_vm_size_t | bytes_allocated                | bytes allocated to this generation                                                                          |             0 |
+| os_vm_size_t | gc_trigger                     | number of bytes at which to trigger a GC                                                                    |       2000000 |
+| os_vm_size_t | bytes_consed_between_gc        | to calculate a new level for gc_trigger                                                                     |               |
+| int          | num_gc                         | number of GCs since the last raise                                                                          |             0 |
+| int          | number_of_gcs_before_promotion | number of GCs to run before raising objects to the next generation                                          |             1 |
+| os_vm_size_t | cum_sum_bytes_allocated        | cumulative sum of bytes allocated to this generation. cleared after a GC of this generation                 |             0 |
+| double       | minimum_age_before_gc          | minimum average memory age before GC. helps prevent a GC when a large number of new objects have been added |          0.75 |
+
+**** initialize gc_alloc
+
+***** gc_init_region()
+
+initialize alloc_region structures for boxed, unboxed, and code pages. each such structure abstracts out the data for an allocation region, allowing a single routine to be used for allocation and closing
+
+struct alloc_region
+
+| type         | name         | description                                    | default value |
+|--------------+--------------+------------------------------------------------+---------------|
+| void *       | free_pointer | free pointer                                   | NULL          |
+| void *       | end_addr     | pointer to the byte after the last usable byte | NULL          |
+| page_index_t | last_page    | find_page_index((char*)end_addr - 1)           | 0             |
+| void *       | start_addr   |                                                | NULL          |
+
+***** TODO what is the link between alloc_regions, ptes, and whatnot?
+
+** os_link_runtime()
+
+initialize linkage table for required foreign symbols (to be loaded with dlsym) and shared libraries.
+
+*** arch_write_linkage_table_entry
+
+this function populates a native Lisp counterpart of the standard PLT/GOT in ELF binaries.e
+
+** write_protect_immobile_space()
+
+goes through the fixedobj immobile space and write-protects pages.
+
+** arch_install_interrupt_handlers()
+
+set up interrupt (signal) handlers for SIGILL and SIGTRAP using undoably_install_low_level_interrupt_handler() so that the signals are immediately handled
+
+** os_install_interrupt_handlers()
+
+set up signal handler for SIG_MEMORY_FAULT using undoably_install_low_level_interrupt_handler()

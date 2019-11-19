@@ -1,0 +1,116 @@
+#+TITLE: Interrupts
+#+STARTUP: showall
+
+* Summary (from the source code):
+
+#+BEGIN_SRC c
+/* As far as I can tell, what's going on here is:
+ *
+ * In the case of most signals, when Lisp asks us to handle the
+ * signal, the outermost handler (the one actually passed to UNIX) is
+ * either interrupt_handle_now(..) or maybe_now_maybe_later(..).
+ * In that case, the Lisp-level handler is stored in interrupt_handlers[..]
+ * and interrupt_low_level_handlers[..] is cleared.
+ *
+ * However, some signals need special handling, e.g.
+ *
+ * o the SIGSEGV (for e.g. Linux) or SIGBUS (for e.g. FreeBSD) used by the
+ *   garbage collector to detect violations of write protection,
+ *   because some cases of such signals (e.g. GC-related violations of
+ *   write protection) are handled at C level and never passed on to
+ *   Lisp. For such signals, we still store any Lisp-level handler
+ *   in interrupt_handlers[..], but for the outermost handle we use
+ *   the value from interrupt_low_level_handlers[..], instead of the
+ *   ordinary interrupt_handle_now(..) or interrupt_handle_later(..).
+ *
+ * o the SIGTRAP (Linux/Alpha) which Lisp code uses to handle breakpoints,
+ *   pseudo-atomic sections, and some classes of error (e.g. "function
+ *   not defined").  This never goes anywhere near the Lisp handlers at all.
+ *   See runtime/alpha-arch.c and code/signal.lisp
+ *
+ * - WHN 20000728, dan 20010128 */
+#+END_SRC
+
+* Relevant data structures:
+
+#+BEGIN_SRC c
+union interrupt_handler {
+    lispobj lisp;
+    void (*c)(int, siginfo_t*, os_context_t*);
+};
+
+extern union interrupt_handler interrupt_handlers[NSIG];
+
+static void (*interrupt_low_level_handlers[NSIG]) (int, siginfo_t*, os_context_t*);
+
+struct interrupt_data {
+    /* signal information for pending signal.  pending_signal=0 when there
+     * is no pending signal. */
+    void (*pending_handler) (int, siginfo_t*, os_context_t*) ;
+    int pending_signal;
+    siginfo_t pending_info;
+    sigset_t pending_mask;
+    /* Was pending mask saved for gc request? True if GC_PENDING or
+     * SIG_STOP_FOR_GC happened in a pseudo atomic with GC_INHIBIT NIL
+     * and with no pending handler. Both deferrable interrupt handlers
+     * and gc are careful not to clobber each other's pending_mask. */
+    boolean gc_blocked_deferrables;
+};
+#+END_SRC
+
+* All handlers are called from either:
+
+** =interrupt_handle_now_handler=
+
+** =maybe_now_maybe_later=
+
+** =unblock_me_trampoline=
+
+** =low_level_handle_now_handler=
+
+** =low_level_maybe_now_maybe_later=
+
+** =low_level_unblock_me_trampoline=
+
+* =maybe_resignal_to_lisp_thread=
+
+#+BEGIN_SRC c
+static boolean maybe_resignal_to_lisp_thread(int signal, os_context_t *context);
+#+END_SRC
+
+** This is a function called from every signal handler via the =SAVE_ERRNO= macro.
+
+#+BEGIN_SRC c
+/* Foreign code may want to start some threads on its own.
+ * Non-targetted, truly asynchronous signals can be delivered to
+ * basically any thread, but invoking Lisp handlers in such foregign
+ * threads is really bad, so let's resignal it.
+ *
+ * This should at least bring attention to the problem, but it cannot
+ * work for SIGSEGV and similar. It is good enough for timers, and
+ * maybe all deferrables. */
+#+END_SRC
+
+** Return false unless =lisp_thread_p(context)= is true.
+
+** Unless the current signal is not deferrable, issue a corruption warning and crash.
+
+** Block all signals that are currently being handled and resend (via kill) the signal to the current process id.
+
+* =lisp_thread_p=
+
+#+BEGIN_SRC c
+int lisp_thread_p(os_context_t *context);
+#+END_SRC
+
+** When SB_THREAD is not enabled, this function fetches the %rsp register and checks to see if it is in the open interval defined by =all_threads->control_stack_start= and =all_threads->control_stack_end=. Returns true if %rsp is within the interval, false otherwise.
+
+* =interrupt_init=
+
+** See [[file+emacs:sbcl-main.org][sbcl_main]].
+
+* =interrupt_handle_now=
+
+* =interrupt_handle_later=
+
+* =maybe_now_maybe_later=

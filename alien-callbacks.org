@@ -1,0 +1,26 @@
+#+TITLE: Alien callbacks
+#+CATEGORY: Runtime
+#+STARTUP: showall
+
+* The macro =cffi:defcallback= relies on =alien-callback= in file:src/code/alien-callback.lisp.
+
+#+BEGIN_SRC lisp
+  (defmacro alien-callback (specifier function &environment env)
+    "Returns an alien-value of alien ftype SPECIFIER, that can be passed to
+  an alien function as a pointer to the FUNCTION. If a callback for the given
+  SPECIFIER and FUNCTION already exists, it is returned instead of consing a new
+  one."
+    ;; Pull out as much work as is convenient to macro-expansion time, specifically
+    ;; everything that can be done given just the SPECIFIER and ENV.
+    (multiple-value-bind (result-type argument-types call-type)
+        (parse-alien-ftype specifier env)
+      `(%sap-alien
+        (%alien-callback-sap ',specifier ',result-type ',argument-types
+                             ,function
+                             (ensure-gethash
+                              ',specifier *alien-callback-wrappers*
+                              ,(alien-callback-lisp-wrapper-lambda
+                                specifier result-type argument-types env))
+                             ,call-type)
+        ',(parse-alien-type specifier env))))
+#+END_SRC

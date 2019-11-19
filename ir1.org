@@ -1,0 +1,212 @@
+#+TITLE: IR1
+#+STARTUP: showall
+
+* Hierarchy: components (ordered by DFO) are made of cblocks, which aggregate nodes.
+
+* From file:src/compiler/node.lisp:
+
+#+BEGIN_QUOTE
+The front-end data structure (IR1) is composed of nodes, representing actual
+evaluations. Linear sequences of nodes in control-flow order are combined
+into blocks (but see JOIN-SUCCESSOR-IF-POSSIBLE for precise conditions);
+control transfers inside a block are represented with CTRANs and between
+blocks -- with BLOCK-SUCC/BLOCK-PRED lists; data transfers are represented
+with LVARs.
+#+END_QUOTE
+
+* Several nodes inherit from the =node= struct.
+
+* Types of nodes (see file:src/compiler/node.lisp).
+
+** CTRAN
+
+Control TRANsfer to some node.
+
+| Name    | Type                                        | Description                            |
+|---------+---------------------------------------------+----------------------------------------|
+| kind    | (member :unused :inside-block :block-start) | Way the continuation is currently used |
+| next    | (or node null)                              | Node to be evaluated next              |
+| use     | (or node null)                              | Node where this CTRAN is used          |
+| block   | (or block null)                             | Block this continuation is in          |
+| entries | list                                        | Entries created by the BLOCK form      |
+
+** LVAR
+
+Linear VARiable. Multiple-value temporal storage.
+
+| Name                  | Type              | Description                                          |
+|-----------------------+-------------------+------------------------------------------------------|
+| dest                  | (or node null)    | Node receiving this value                            |
+| %derived-type         | (or ctype null)   | Cached type for this value                           |
+| uses                  | (or node list)    | Node(s) where this LVAR is used                      |
+| reoptimize            | boolean           | Whether IR1 optimization should be applied           |
+| dynamic-extent        | (or null cleanup) | CLEANUP protecting the LVAR if it has dynamic extent |
+| info                  |                   | Placeholder for backend annotations                  |
+| dependent-casts       |                   |                                                      |
+| annotations           |                   |                                                      |
+| dependent-annotations |                   |                                                      |
+
+There are a number of structures inheriting from =lvar-annotation=.
+
+** Nodes
+
+*** node
+
+| Name        | Type            | Description                                                |
+|-------------+-----------------+------------------------------------------------------------|
+| reoptimize  | boolean         | Node needs being reoptimized?                              |
+| next        | (or ctran null) | CTRAN indicating what to do after evaluating this node     |
+| prev        | (or ctran null) | CTRAN for which the current node appears in its next field |
+| lexenv      | lexenv          | Lexical environment                                        |
+| source-path | list            |                                                            |
+| tail-p      | boolean         | Used by the backend for tail-recursion                     |
+
+*** valued-node
+
+| Name         | Type           | Description                                                           |
+|--------------+----------------+-----------------------------------------------------------------------|
+| derived-type | ctype          | Bottom-up derived type for node                                       |
+| lvar         | (or lvar null) | LVAR receiving the values produced by this node (nil if value unused) |
+
+** CLOOP
+
+Loop structure.
+
+| Name      | Type                              | Description                                                                                                                                                                                      |
+|-----------+-----------------------------------+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| kind      | (member :outer :natural :strange) | :outer is an outermost loop (represents all the code in a component), :natural is a normal loop with just one entry, and :strange is a segment of a "strange loop" in a non-reducible flow graph |
+| head      | (or cblock null)                  | First and last blocks in the loop                                                                                                                                                                |
+| tail      | list                              |                                                                                                                                                                                                  |
+| exits     | list                              | All blocks in the loop (or descendants) having a successor outside the loop                                                                                                                      |
+| superior  | (or cloop null)                   | Loop that this loop is nested within                                                                                                                                                             |
+| inferiors | list                              | Loops nested within the current one                                                                                                                                                              |
+| depth     | fixnum                            |                                                                                                                                                                                                  |
+| blocks    | (or cblock null)                  | Head of the list of blocks directly within this loop                                                                                                                                             |
+| info      |                                   | Placeholder for backend information                                                                                                                                                              |
+
+** CBLOCK
+
+#+BEGIN_QUOTE
+The CBLOCK structure represents a basic block. We include SSET-ELEMENT so
+that we can have sets of blocks. Initially the SSET-ELEMENT-NUMBER is null,
+DFO analysis numbers in reverse DFO.  During IR2 conversion, IR1 blocks are
+re-numbered in forward emit order. This latter numbering also forms the basis
+of the block numbering in the debug-info (though that is relative to the
+start of the function.)
+#+END_QUOTE
+
+*** The =cblock= structure inherits from =sset-element= (i.e., a cblock is an element of a sset, which is a light-weight hash table underlying a set data structure).
+
+| Name          | Type                             | Description                                                                       |
+|---------------+----------------------------------+-----------------------------------------------------------------------------------|
+| pred          | list                             | List of all predecessor blocks                                                    |
+| succ          | list                             | List of all successor blocks                                                      |
+| start         | (or ctran null)                  | CTRAN node heading this block                                                     |
+| last          | (or node null)                   | Last node in this block                                                           |
+| next          | (or cblock null)                 | forward CBLOCK (in DFO)                                                           |
+| prev          | (or cblock null)                 | backward CBLOCK (in DFO)                                                          |
+| flags         | attributes                       | Block attributes                                                                  |
+| kill          |                                  | List of "killed" TNs                                                              |
+| in            |                                  | Set used in constraint/copy propagation                                           |
+| out           |                                  | Set used in constraint/copy propagation                                           |
+| dominators    | (or sset null)                   | Set of all blocks that dominate this block. NIL means "all blocks in component"   |
+| loop          | (or cloop null)                  | LOOP that this block belongs to                                                   |
+| loop-next     | (or cblock null)                 | Next block in the loop                                                            |
+| component     | (or component null)              | The component that this block belongs to                                          |
+| flag          |                                  | Used for graph-traversal code                                                     |
+| info          |                                  | Info used by the back-end                                                         |
+| xrefs         | list                             | Macroexpansions and source transforms that happened in this block (used for xref) |
+| physenv-cache | (or physenv (member :none) null) | Cache of the physenv of a block during lifetime analysis                          |
+
+* COMPONENT
+
+#+BEGIN_QUOTE
+A COMPONENT structure provides a handle on a connected piece of the flow
+graph. Most of the passes in the compiler operate on COMPONENTs rather than
+on the entire flow graph.
+#+END_QUOTE
+
+| Name                  | Type                                                       | Description                                                    |
+|-----------------------+------------------------------------------------------------+----------------------------------------------------------------|
+| %mem-space            | (member nil :dynamic :immobile :auto)                      | Space where the component will be allocated                    |
+| kind                  | (member nil :toplevel :complex-toplevel :initial :deleted) | Somewhat obsolete                                              |
+| head                  | cblock                                                     | Predecessor for entry/exit point                               |
+| tail                  | cblock                                                     | Successor for entry/exit point                                 |
+| last-block            | cblock                                                     | New blocks are inserted before this                            |
+| lambdas               | list                                                       | List of CLAMBDA structures for all functions in this component |
+| new-functionals       | list                                                       |                                                                |
+| reoptimize            | (member nil :maybe t)                                      |                                                                |
+| reanalyze             | boolean                                                    | T if the DFO should be recomputed                              |
+| name                  |                                                            | Name for the code in this component                            |
+| info                  | (or ir2-component (member :no-ir2-yet :dead))              | Notes written by the IR2 stage                                 |
+| inline-expansions     | index                                                      | Number of inline expansions compiling this component           |
+| failed-optimizations  | hash-table                                                 |                                                                |
+| reanalyze-functionals | list                                                       |                                                                |
+| delete-blocks         | list                                                       |                                                                |
+| nlx-info-generated-p  | boolean                                                    |                                                                |
+| dx-lvars              | list                                                       |                                                                |
+| outer-loop            | cloop                                                      | Default LOOP in the component                                  |
+| sset-number           | fixnum                                                     | Current sset index                                             |
+
+* CLEANUP
+
+#+BEGIN_QUOTE
+A CLEANUP structure represents some dynamic binding action. Blocks are
+annotated with the current CLEANUP so that dynamic bindings can be removed
+when control is transferred out of the binding environment. We arrange for
+changes in dynamic bindings to happen at block boundaries, so that cleanup
+code may easily be inserted.  The "mess-up" action is explicitly represented
+by a funny function call or ENTRY node.
+#+END_QUOTE
+
+| Name    | Type                                                                          | Description                                                     |
+|---------+-------------------------------------------------------------------------------+-----------------------------------------------------------------|
+| kind    | (member :special-bind :catch :unwind-protect :block :tagbody :dynamic-extent) |                                                                 |
+| mess-up | (or node null)                                                                | Node to clean after                                             |
+| info    | list                                                                          | List of NLX-INFO structures whose NLX-INFO-CLEANUP is this node |
+
+* PHYSENV
+
+* TAIL-SET
+
+#+BEGIN_QUOTE
+An TAIL-SET structure is used to accumulate information about tail-recursive
+local calls. The "tail set" is effectively the transitive closure of the "is
+called tail-recursively by" relation.
+
+All functions in the same tail set share the same TAIL-SET
+structure. Initially each function has its own TAIL-SET, but when
+IR1-OPTIMIZE-RETURN notices a tail local call, it joins the tail sets of the
+called function and the calling function.
+#+END_QUOTE
+
+| Name | Type  | Description                                                |
+|------+-------+------------------------------------------------------------|
+| funs | list  | List of LAMBDAs in tail set                                |
+| type | ctype | Best guess (union) of the type returned by these functions |
+| info |       | Info used by the back-end                                  |
+
+
+* NLX-INFO
+
+#+BEGIN_QUOTE
+An NLX-INFO structure is used to collect various information about non-local
+exits. This is effectively an annotation on the continuation, although it is
+accessed by searching in the PHYSENV-NLX-INFO.
+#+END_QUOTE
+
+| Name    | Type             | Description                                |
+|---------+------------------+--------------------------------------------|
+| cleanup | cleanup          | Cleanup associated with the non-local exit |
+| block   | cblock           | The continuation (i.e., block) exited to   |
+| target  | (or cblock null) |                                            |
+| safe-p  | boolean          |                                            |
+| info    |                  |                                            |
+
+* LEAF structures
+
+
+
+* TODO dominator blocks
+
+* TODO physenvs

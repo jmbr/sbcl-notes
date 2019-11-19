@@ -1,0 +1,34 @@
+#+TITLE: Binding stack
+#+STARTUP: showall
+
+* See /Chapter 9: Specials/ in the /SBCL Internals/ documentation.
+
+* By contrast with the control stack in x86 platforms, the binding stack grows upwards.
+
+* Its inner-workings are laid out in
+
+** file:src/compiler/x86-64/cell.lisp
+
+** file:src/runtime/dynbind.c
+
+* The binding stack behaves differently on single- and multi-threaded systems.
+
+* Binding and unbinding (from dynbind.c).
+
+** Binding in single-threaded systems amounts to:
+
+*** Increase =sb-vm::*binding-stack-pointer*= by a quad word (i.e., =n-word-bytes=).
+
+*** Store the symbol and its value in the binding stack.
+
+** Unbinding in single-threaded systems consists of:
+
+*** Locate the last binding pushed to the stack.
+
+*** Set the corresponding symbol and value to zero.
+
+*** Decrease =sb-vm::*binding-stack-pointer*= by a quad word.
+
+** Note that it is necessary to zero-out the symbol and the value to prevent the garbage collector from holding on to the memory referenced by the symbol and its value.
+
+** The same happens in cell.lisp via the dynbind and unbind virtual operations (VOPs).

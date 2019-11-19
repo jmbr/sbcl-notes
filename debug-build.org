@@ -1,0 +1,15 @@
+#+BEGIN_SRC bash
+sh make.sh --fancy \
+           --with-sb-after-xc-core \
+           --with-sb-dynamic-core \
+           --with-sb-fasteval \
+           --with-sb-fluid \
+           --with-sb-linkable-runtime \
+           --with-sb-qshow \
+           --with-sb-show-assem \
+           --with-sb-source-locations \
+           --with-sb-xref-for-internals \
+           --with-ud2-breakpoints \
+           --without-sb-eval \
+           --without-sb-thread
+#+END_SRC

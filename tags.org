@@ -1,0 +1,153 @@
+#+TITLE: Type tags
+#+STARTUP: showall
+
+* Variables of type =lispobj= have a lowtag and, possibly, a widetag (see src/runtime/runtime.h and src/runtime/genesis/constants.h).
+
+The lowtag is a set of low-order bits (=LOWTAG_MASK = 0xf=) giving information about the type of the object. To retrieve its actual value, we shift to the left as many positions as bits are in the lowtag.
+
+The widetag is associated to a header lispobj and it spans the lowest order byte (=WIDETAG_MASK = 0xff=).
+
+See also =print_obj= in src/runtime/print.c.
+
+* From src/compiler/generic/early-objdef.lisp:
+
+Note that the low-tags enumerated below are probably out of date. Check the current definitions in src/runtime/genesis/constants.h
+
+#+BEGIN_SRC lisp
+;;; Tags for the main low-level types are stored in the low n (usually three)
+;;; bits to identify the type of a machine word.  Certain constraints
+;;; apply:
+;;;   * EVEN-FIXNUM-LOWTAG and ODD-FIXNUM-LOWTAG must be 0 and 4: code
+;;;     which shifts left two places to convert raw integers to tagged
+;;;     fixnums is ubiquitous.
+;;;   * LIST-POINTER-LOWTAG + N-WORD-BYTES = OTHER-POINTER-LOWTAG: NIL
+;;;     is both a cons and a symbol (at the same address) and depends on this.
+;;;     See the definition of SYMBOL in objdef.lisp
+;;;   * OTHER-POINTER-LOWTAG > 4: Some code in the SPARC backend,
+;;;     which uses bit 2 of the ALLOC register to indicate that
+;;;     PSEUDO-ATOMIC is on, doesn't strip the low bits of reg_ALLOC
+;;;     before ORing in OTHER-POINTER-LOWTAG within a PSEUDO-ATOMIC
+;;;     section.
+;;;   * OTHER-IMMEDIATE-0-LOWTAG are spaced 4 apart: various code wants to
+;;;     iterate through these
+;;;   * Allocation code on Alpha wants lowtags for heap-allocated
+;;;     objects to be odd.
+;;; (These are just the ones we know about as of sbcl-0.7.1.22. There
+;;; might easily be more, since these values have stayed highly
+;;; constrained for more than a decade, an inviting target for
+;;; inventive abstraction-phobic maintainers.:-)
+;;;
+;;; Another way to look at lowtags is that there is no one lowtag
+;;; length.  On 32-bit platforms, fixnums and other-immediates have a
+;;; lowtag length of two bits, and pointers have a lowtag length of
+;;; three bits.  On 64-bit platforms, fixnums and pointers gain an
+;;; extra bit, and six "pad" lowtags waste the extra encoding space so
+;;; obtained.
+;;;
+;;;  x00 -- fixnum
+;;;  x10 -- other-immediate
+;;;  001 -- instance-pointer
+;;;  011 -- list-pointer
+;;;  101 -- fun-pointer
+;;;  111 -- other-pointer
+;;;
+;;; If you change the tag layout, check the various functions in
+;;; src/runtime/runtime.h to see if they need to be updated, along
+;;; with print_obj() in src/runtime/print.c, possibly 'late-objdef.lisp'
+;;; and possibly the code in src/code/room.
+#+END_SRC
+
+* To calculate offsets for struct fields in src/runtime/genesis/*.h we must use the above table together with the formula SLOT-OFFSET * N-WORD-BYTES (usually 4 bytes) - LOWTAG.
+
+For example,
+
+#+BEGIN_SRC c
+struct cons {
+    lispobj car;
+    lispobj cdr;
+};
+#+END_SRC
+
+The offset for the field named car is computed according to:
+
+| SLOT-OFFSET | N-WORD-BYTES | LOWTAG                  | Result               |
+|-------------+--------------+-------------------------+----------------------|
+|           0 |            8 | LIST_POINTER_LOWTAG = 7 | CONS_CAR_OFFSET = -7 |
+|           1 |            8 | LIST_POINTER_LOWTAG = 7 | CONS_CDR_OFFSET = 1  |
+
+Another example,
+
+#+BEGIN_SRC lisp
+(define-primitive-object (ratio :type ratio
+                                :lowtag other-pointer-lowtag
+                                :widetag ratio-widetag
+                                :alloc-trans %make-ratio)
+  (numerator :type integer
+             :ref-known (flushable movable)
+             :ref-trans %numerator
+             :init :arg)
+  (denominator :type integer
+               :ref-known (flushable movable)
+               :ref-trans %denominator
+               :init :arg))
+#+END_SRC
+
+#+BEGIN_SRC c
+struct ratio {
+    lispobj header;
+    lispobj numerator;
+    lispobj denominator;
+};
+
+#define RATIO_NUMERATOR_OFFSET -7
+#define RATIO_DENOMINATOR_OFFSET 1
+#+END_SRC
+
+1 * 8 - 
+
+* The code in src/runtime/print.c provides good examples on how to interpret tags.
+
+* The specific tags corresponding to each object are defined in src/compiler/generic/objdef.lisp
+
+* Code headers:
+
+#+BEGIN_SRC lisp
+#|
+Code header representation:
+
+  |       total words     | widetag |
+  | (3 bytes less 2 bits) |         |
+  +-----------------------+---------+  [32-bit words]
+  |      N boxed header bytes       |
+  +---------------------------------+
+  max total payload size in words = #x3fffff
+
+  |            total words          | gc_gen | 0 | 0 | widetag |
+  |            (4 bytes)            |        |   |   |         |
+  +------------------------------------------------------------+  [64-bit words]
+  |            serial#              |   N boxed header bytes   |
+  |            (4 bytes)            |        (4 bytes)         |
+  +------------------------------------------------------------+
+
+  the two zero bytes are reserved for future use
+  max total payload size in words = uint_max
+    (should probably made the same as for 32-bit word size for consistency)
+
+For both:
+  code-size = total words * n-word-bytes - boxed bytes
+  text-size = code-size - simple-fun table size - padding bytes
+  bit 31 of word 0 = fullcgc mark bit
+  bit 30           = touched since last GC bit
+  The boxed byte count is stored "raw" (i.e. it's not a tagged value,
+  but it has fixnum nature)
+
+Since most architectures can not atomically store and load 2 words at once,
+it is essential that code size be computable by loading a single word
+to make backtrace reliable (i.e. in the heap search step).
+
+Note that vector objects require reading their length from a non-header word,
+but this not subject to a data race because only 1 word conveys the size.
+In addition there are no vectors on code pages which are the pages scanned
+during backtrace.
+|#
+#+END_SRC

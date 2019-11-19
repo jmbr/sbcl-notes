@@ -1,0 +1,229 @@
+#+TITLE: Threads
+#+CATEGORY: Threads
+#+STARTUP: showall
+
+* int dynamic_values_bytes = 4096 * sizeof(lispobj);  // same for all threads
+
+* =struct thread=
+
+src/runtime/genesis/thread.h & src/compiler/generic/objdef.lisp
+
+| type                    | name                               | description                                                                                                                                               |
+|-------------------------+------------------------------------+-----------------------------------------------------------------------------------------------------------------------------------------------------------|
+| lispobj                 | no_tls_value_marker                | used at thread startup to pass the address of the start routine into the trampoline                                                                       |
+| os_thread_t             | os_thread                          | thread handle (typedef os_thread_t pthread_t)                                                                                                             |
+| lispobj *               | binding_stack_pointer              |                                                                                                                                                           |
+| lispobj *               | alien_stack_pointer                |                                                                                                                                                           |
+| lispobj                 | stepping                           |                                                                                                                                                           |
+| lispobj                 | msan-param-tls                     | related to memory sanitizer feature                                                                                                                       |
+| lispobj                 | dynspace_addr                      |                                                                                                                                                           |
+| lispobj                 | dynspace_card_count                |                                                                                                                                                           |
+| lispobj                 | dynspace_pte_base                  |                                                                                                                                                           |
+| uword_t *               | profile_data                       | deterministic consing profile recording area                                                                                                              |
+| struct alloc_region     | alloc_region                       | not a pointer! only the fields free_pointer and end_addr are needed by Lisp                                                                               |
+| void *                  | os_address                         | original address at which the memory was allocated (may have different alignment to what SBCL prefers). used for releasing resources when the thread dies |
+| lispobj *               | alien_stack_start                  | the following *_stack_start fields are not accessed much from lisp                                                                                        |
+| lispobj *               | binding_stack_start                |                                                                                                                                                           |
+| lispobj *               | control_stack_start                |                                                                                                                                                           |
+| lispobj *               | control_stack_end                  |                                                                                                                                                           |
+| lispobj                 | control_stack_guard_page_protected |                                                                                                                                                           |
+| struct thread *         | this                               | pointers within the doubly-linked list all_threads                                                                                                        |
+| struct thread *         | pref                               |                                                                                                                                                           |
+| struct thread *         | next                               |                                                                                                                                                           |
+| lispobj                 | state                              | starting, running, suspended, dead                                                                                                                        |
+| struct interrupt_data * | interrupt_data                     |                                                                                                                                                           |
+
+the slots from binding_stack_pointer to region are there so that the x86-64 assembly can use single-byte displacements to refer to those. this reduces the code size by fixing TLS offsets to be < 2^7.
+
+* =create_initial_thread=
+
+#+BEGIN_SRC c
+void create_initial_thread(lispobj initial_function)
+#+END_SRC
+
+** call =initial_thread_trampoline= with the result of =create_thread_struct=
+
+* =create_thread_struct=
+
+#+BEGIN_SRC c
+static struct thread *create_thread_struct(lispobj start_routine)
+#+END_SRC
+
+#+BEGIN_SRC txt
+this is called from any other thread to create the new one, and
+initialize all parts of it that can be initialized from another
+thread
+
+The allocated memory will be laid out as depicted below.
+Left-to-right is in order of lowest to highest address:
+
+     ______ spaces as obtained from OS
+    /   ___ aligned_spaces
+   /   /
+ (0) (1)       (2)       (3)       (4)    (5)          (6)
+  |   | CONTROL | BINDING |  ALIEN  |  CSP | thread     |          |
+  |   |  STACK  |  STACK  |  STACK  | PAGE | structure  | altstack |
+  |...|------------------------------------------------------------|
+         2MiB       1MiB     1MiB               (*)         (**)
+
+ |  (*) interrupt contexts and Lisp TLS |   (**) altstack           |
+ |-----------|--------------------------|------------|--------------|
+ | interrupt | struct + dynamically     | nonpointer |   sigstack   |
+ | contexts  | thread   assigned TLS    |     data   |              |
+ +-----------+--------------------------|------------+--------------|
+ | 1K words  | <--- TLS_SIZE words ---> | ~200 bytes | 32*SIGSTKSZ  |
+             ^ thread base
+
+  (1) = control stack start. default size shown
+  (2) = binding stack start. size = BINDING_STACK_SIZE
+  (3) = alien stack start.   size = ALIEN_STACK_SIZE
+  (4) = C safepoint page.    size = BACKEND_PAGE_BYTES or 0
+  (5) = per_thread_data.     size = (MAX_INTERRUPTS + TLS_SIZE) words
+  (6) = nonpointer_thread_data and signal stack.
+
+  (0) and (1) may coincide; (4) and (5) may coincide
+
+  - Lisp TLS overlaps 'struct thread' so that the first N (~30) words
+    have preassigned TLS indices.
+
+  - nonpointer data are not in 'struct thread' because placing them there
+    makes it tough to calculate addresses in 'struct thread' from Lisp.
+    (Every 'struct thread' slot has a known size)
+
+On sb-safepoint builds one page before the thread base is used for the foreign calls safepoint.
+#+END_SRC
+
+see above: THREAD_STRUCT_SIZE = thread_control_stack_size + BINDING_STACK_SIZE + ALIEN_STACK_SIZE + sizeof(struct non_pointer_thread_data) + MAX_INTERRUPTS * sizeof(os_context_t) + dynamic_values_bytes + ALT_STACK_SIZE + THREAD_ALIGNMENT_BYTES + THREAD_CSP_PAGE_SIZE
+
+** allocate spaces (see diagram above)
+
+** point =struct thread * th= to the appropriate offset within the (aligned) spaces just allocated
+
+** write the values of VARYOBJ_SPACE_START, VARYOBJ_CARD_COUNT, and VARYOBJ_CARD_MARKS_SLOT into thread structure.
+
+** =th->dynspace_addr = DYNAMIC_SPACE_START= (0x1000000000)
+
+** =th->dynspace_card_count = page_table_pages=
+
+** =th->dynspace_pte_base = page_table=
+
+** =th->os_address = spaces=
+
+keep this so the memory can be released later
+
+** set up the fields =control_stack_start=, =control_stack_end=, =binding_stack_start=, =alien_stack_start=, =this=, and =os_thread= in the reasonable way.
+
+** set =sb-vm::*binding-stack-pointer*= on the Lisp side to be equal to =binding_stack_start=
+
+** =th->control_stack_guard_page_protected = T=
+
+** set up nonpointer_data (this is due to the fact that the size of the Lisp-side of =struct thread= must be known in advance)
+
+*** =struct nonpointer_thread_data *nonpointer_data = (void *) ((char*) th + dynamic_values_bytes)=
+
+*** =th->interrupt_data = &nonpointer_data->interrupt_data=
+
+** set =th->state = STATE_RUNNING= (XXX change the state when returning from call_into_lisp_first?)
+
+** set up =th->alien_stack_pointer=
+
+** call =clear_pseudo_atomic_atomic()=
+
+this executes =pa_bits = pa_bits & 1=, where pa_bits is the symbol =sb-kernel:*pseudo-atomic-bits*= (the first bit is left on if it was on while the rest of the bits are cleared.)
+
+recall that bit #0 denotes "atomicness" while bit #1 denotes "interruptedness" (see [[https://sourceforge.net/p/sbcl/mailman/message/13603489/][sbcl-commits]])
+
+** call =clear_pseudo_atomic_interrupted()=
+
+this executes =pa_bits = pa_bits & ~1= (first bit is cleared while the rest of the bits are preserved)
+
+** call =gc_init_region()=
+
+this ensures that =th->alloc_region= is properly initialized (empty).
+
+** set up on the Lisp side:
+
+*** =sb-vm:*binding-stack-start*=
+
+*** =sb-vm:*control-stack-start*=
+
+*** =sb-vm:*control-stack-end*=
+
+*** =sb-c:*alien-stack-pointer*=
+
+** =th->interrupt_data->pending_handler = NULL=
+
+** =th->interrupt_data->gc_blocked_deferrables = false=
+
+=gc_blocked_deferrables= is true if =interrupt_data->pending_mask= was saved for a GC request (i.e., if GC_PENDING or SIG_STOP_FOR_GC happened)
+
+XXX possibly affects return from call_into_lisp_first_time
+
+** set up on the Lisp side:
+
+#+BEGIN_SRC lisp
+(setf sb-kernel:*free-interrupt-context-index* 0
+      sb-sys:*allow-with-interrupts* t
+      sb-sys:*interrupts-enabled* t
+      sb-vm:*alloc-signal* t
+      sb-sys:*interrupt-pending* nil
+      sb-kernel:*in-without-gcing* nil
+      sb-kernel:*gc-inhibit* nil
+      sb-kernel:*gc-pending* nil
+      sb-vm:*current-catch-block* 0
+      sb-vm::*current-unwind-protect-block* 0)
+#+END_SRC
+
+** =th->no_tls_value_marker = start_routine=
+
+** =th->stepping = 0=
+
+** return th
+
+* =initial_thread_trampoline=
+
+#+BEGIN_SRC c
+static int initial_thread_trampoline(struct thread *th)
+#+END_SRC
+
+** =lispobj *args = NULL=
+
+** =function = th->no_tls_value_marker=
+
+** =th->no_tls_value_marker = NO_TLS_VALUE_MARKER_WIDETAG=
+
+the address of the toplevel function stored in the core by save-lisp-and-die is written in th->no_tls_value_marker (the first field in struct thread) at the beginning but as soon as sbcl is reading to call it, the field in struct thread is set to NO_TLS_MARKER_VALUE.
+
+** =arch_os_thread_init(th)=
+
+set up signal stack for SIGSEGV handler.
+
+** link thread to the doubly-linked list =all_threads=.
+
+** =th->os_thread = thread_self()=
+
+thread_self is zero in mono-threaded code (otherwise it is pthread_self())
+
+** write-protect the following pages:
+
+control_stack_hard_guard_page
+
+binding_stack_hard_guard_page
+
+alien_stack_hard_guard_page
+
+control_stack_guard_page
+
+binding_stack_guard_page
+
+alien_stack_guard_page
+
+** return =call_into_lisp_first_time()=
+
+* =arch_os_thread_init=
+
+#+BEGIN_SRC c
+int arch_os_thread_init(struct thread *thread)
+#+END_SRC
+
+this function invokes =sigaltstack= to define a new alternative signal stack. the alternative signal stack is meant to be used during the execution of the signal handler in charge of dealing with SIG_MEMORY_FAULT (aka SIGSEGV).

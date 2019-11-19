@@ -1,0 +1,144 @@
+#+TITLE: FASL files
+#+STARTUP: showall
+
+* The FASL format is presented in the CMU CL internals document. It contains instructions required to reconstruct and fix-up data structures and code.
+
+* A quick way to inspect the contents of a FASL file is to load it as:
+
+#+BEGIN_SRC lisp
+CL-USER> (let ((*load-print* t)
+               (sb-fasl::*show-fops-p* t))
+           (load "my-function.fasl"))
+    F1 : [1,0] 53 7                fop-named-package-save
+    FA : [2,1] 4F D 0              fop-symbol-in-package-save
+   103 : [3,1] 53 10               fop-named-package-save
+   115 : [4,2] 4F 17 2             fop-symbol-in-package-save
+   123 : [4,2] 3E 4                fop-verify-table-size
+   125 : [5,2] 53 5                fop-named-package-save
+   12C : [6,3] 4F 13 4             fop-symbol-in-package-save
+   138 : [6,4] 22                  fop-word-integer
+   141 : [7,5] 4F 13 4             fop-symbol-in-package-save
+   14D : [7,6] 22                  fop-word-integer
+   156 : [7,7] 04 3                fop-push
+   158 : [7,8] 02                  1-arg-nil
+   159 : [7,9] 02                  1-arg-nil
+   15A : [8,10] 4D 11              fop-lisp-symbol-save
+   164 : [8,11] 2B 5               fop-spec-vector
+   16C : [9,11] 05                 fop-move-to-table
+   16D : [9,11] 5C 1               fop-vector
+   16F : [10,11] 05                fop-move-to-table
+   170 : [10,10] 91 1              fop-list*
+   171 : [11,10] 05                fop-move-to-table
+   172 : [11,11] 04 3              fop-push
+   174 : [11,12] 64 25             fop-base-string
+   19B : [12,12] 05                fop-move-to-table
+   19C : [12,13] 22                fop-word-integer
+   1A5 : [12,14] 22                fop-word-integer
+   1AE : [12,15] 02                1-arg-nil
+   1AF : [12,16] 74                fop-layout-of-debug-source
+   1B0 : [13,16] 05                fop-move-to-table
+   1B1 : [13,12] 30 4              fop-struct
+   1B3 : [14,12] 05                fop-move-to-table
+   1B4 : [14,13] 04 3              fop-push
+   1B6 : [14,14] 2B 4              fop-spec-vector
+   1C1 : [15,14] 05                fop-move-to-table
+   1C2 : [15,15] 02                1-arg-nil
+   1C3 : [16,16] 4E F              fop-keyword-symbol-save
+   1CC : [17,17] 4E 11             fop-keyword-symbol-save
+   1D6 : [17,18] 22                fop-word-integer
+   1DF : [17,19] 04 3              fop-push
+   1E1 : [17,20] 2B 3              fop-spec-vector
+   1FC : [18,20] 05                fop-move-to-table
+   1FD : [18,21] 02                1-arg-nil
+   1FE : [18,22] 04 F              fop-push
+   200 : [18,23] 04 10             fop-push
+   202 : [18,24] 22                fop-word-integer
+   20B : [18,25] 02                1-arg-nil
+   20C : [18,26] 71                fop-layout-of-compiled-debug-fun
+   20D : [19,26] 05                fop-move-to-table
+   20E : [19,19] 30 7              fop-struct
+   210 : [20,19] 05                fop-move-to-table
+   211 : [21,19] 53 4              fop-named-package-save
+   217 : [22,20] 4F 37 14          fop-symbol-in-package-save
+   235 : [22,21] 28                fop-int-const-neg1
+   236 : [22,22] 6C                fop-layout-of-t
+   237 : [23,22] 05                fop-move-to-table
+   238 : [23,23] 6D                fop-layout-of-structure-object
+   239 : [24,23] 05                fop-move-to-table
+   23A : [24,24] 70                fop-layout-of-debug-fun
+   23B : [25,24] 05                fop-move-to-table
+   23C : [25,25] 04 12             fop-push
+   23E : [25,22] 5C 4              fop-vector
+   240 : [26,22] 05                fop-move-to-table
+   241 : [26,20] 2D 5 1 7          fop-layout
+   245 : [27,20] 05                fop-move-to-table
+   246 : [27,13] 30 7              fop-struct
+   248 : [28,13] 05                fop-move-to-table
+   249 : [28,14] 5C 0              fop-vector
+   24B : [29,14] 05                fop-move-to-table
+   24C : [29,15] 22                fop-word-integer
+   255 : [29,16] 73                fop-layout-of-compiled-debug-info
+   256 : [30,16] 05                fop-move-to-table
+   257 : [30,11] 30 5              fop-struct
+   259 : [31,11] 05                fop-move-to-table
+   25A : [31,3] 10 11 50 2         fop-load-code
+   2AE : [32,2] 01                 fop-pop
+   2AF : [32,3] 04 1F              fop-push
+   2B1 : [32,3] 14 0               fop-fun-entry
+   2B3 : [33,2] 01                 fop-pop
+   2B4 : [33,3] 04 20              fop-push
+   2B6 : [33,0] 38 2               fop-funcall
+; my-function
+   2B8 : [33,0] 3F                 fop-verify-empty-stack
+   2B9 : [33,0] 3E 21              fop-verify-table-size
+t
+#+END_SRC
+
+The actual contents of the file are:
+
+#+BEGIN_TEXT
+00000000: 2321 2f75 7372 2f6c 6f63 616c 2f62 696e  #!/usr/local/bin
+00000010: 2f73 6263 6c20 2d2d 7363 7269 7074 0a23  /sbcl --script.#
+00000020: 2046 4153 4c0a 2020 636f 6d70 696c 6564   FASL.  compiled
+00000030: 2066 726f 6d20 227e 2f73 6f75 7263 6573   from "~/sources
+00000040: 2f73 6263 6c2d 6e6f 7465 732f 6d79 2d66  /sbcl-notes/my-f
+00000050: 756e 6374 696f 6e2e 6c69 7370 220a 2020  unction.lisp".
+00000060: 7573 696e 6720 5342 434c 2076 6572 7369  using SBCL versi
+00000070: 6f6e 2031 2e35 2e37 2e39 352d 6239 6566  on 1.5.7.95-b9ef
+00000080: 3239 3963 380a ff06 0000 0058 3836 2d36  299c8......X86-6
+00000090: 344e 0000 0000 0000 0012 0000 0031 2e35  4N...........1.5
+000000a0: 2e37 2e39 352d 6239 6566 3239 3963 383e  .7.95-b9ef299c8>
+000000b0: 0000 0028 4745 4e43 4743 2053 422d 4459  ...(GENCGC SB-DY
+000000c0: 4e41 4d49 432d 434f 5245 2053 422d 5041  NAMIC-CORE SB-PA
+000000d0: 434b 4147 452d 4c4f 434b 5320 5342 2d54  CKAGE-LOCKS SB-T
+000000e0: 4852 4541 4420 5342 2d55 4e49 434f 4445  HREAD SB-UNICODE
+000000f0: 2953 0753 422d 494d 504c 4f0d 0025 4445  )S.SB-IMPLO..%DE
+00000100: 4655 4e53 1043 4f4d 4d4f 4e2d 4c49 5350  FUNS.COMMON-LISP
+00000110: 2d55 5345 524f 1702 4d59 2d46 554e 4354  -USERO..MY-FUNCT
+00000120: 494f 4e3e 0453 0553 422d 564d 4f13 0447  ION>.S.SB-VMO..G
+00000130: 454e 4552 4943 2d2b 2201 1d00 0000 0000  ENERIC-+".......
+00000140: 004f 1304 4745 4e45 5249 432d 2d22 8115  .O..GENERIC--"..
+00000150: 0000 0000 0000 0403 0202 4d11 4655 4e43  ..........M.FUNC
+00000160: 5449 4f4e 2b05 9105 0209 4b74 055c 0105  TION+.....Kt.\..
+00000170: 9105 0403 6425 7e2f 736f 7572 6365 732f  ....d%~/sources/
+00000180: 7362 636c 2d6e 6f74 6573 2f6d 792d 6675  sbcl-notes/my-fu
+00000190: 6e63 7469 6f6e 2e6c 6973 7005 22a7 e55f  nction.lisp.".._
+000001a0: e100 0000 0022 b1e5 5fe1 0000 0000 0274  .....".._......t
+000001b0: 0530 0405 0403 2b04 9960 0020 0c20 0820  .0....+..`. . .
+000001c0: 1c05 024e 0f4d 494e 494d 414c 4e11 5354  ...N.MINIMALN.ST
+000001d0: 414e 4441 5244 2200 4400 2600 0000 0004  ANDARD".D.&.....
+000001e0: 032b 03ad 280c 0000 5800 0010 2008 0000  .+..(...X... ...
+000001f0: 0000 0000 201c 0000 0000 0000 0502 040f  .... ...........
+00000200: 0410 222a 4600 0000 0000 0002 7105 3007  .."*F.......q.0.
+00000210: 0553 0453 422d 434f 3714 434f 4d50 494c  .S.SB-CO7.COMPIL
+00000220: 4544 2d44 4542 5547 2d46 554e 2d45 5854  ED-DEBUG-FUN-EXT
+00000230: 4552 4e41 4c28 6c05 6d05 7005 0412 5c04  ERNAL(l.m.p...\.
+00000240: 052d 0501 0705 3007 055c 0005 2201 0100  .-....0..\.."...
+00000250: 0000 0000 0073 0530 0505 1011 5002 3108  .....s.0....P.1.
+00000260: 0000 0000 0000 0000 0000 0000 0000 8f45  ...............E
+00000270: 0848 83f9 0675 2b48 8d65 f848 8bda 488b  .H...u+H.e.H..H.
+00000280: d748 8bfe 4889 5df8 e800 0000 0048 8bfa  .H..H.]......H..
+00000290: 488b 5df8 488b d3e8 0000 0000 488b e5f8  H.].H.......H...
+000002a0: 5dc3 cc10 0000 0000 0000 1200 0800 0104  ]...............
+000002b0: 1f14 0001 0420 3802 3f3e 2140            ..... 8.?>!@
+#+END_TEXT

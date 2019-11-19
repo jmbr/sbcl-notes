@@ -1,0 +1,5 @@
+#+STARTUP: showall
+
+* DONE how do the =alloc_region=, =page=, etc. structures fit together?
+
+* TODO binding stack? <--- possibly answered in sbcl-internals

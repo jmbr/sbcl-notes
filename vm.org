@@ -1,0 +1,159 @@
+#+TITLE: VM representation
+#+STARTUP: showall
+
+* Storage bases (SBs):
+
+** From file:src/compiler/vop.lisp:
+
+#+BEGIN_SRC lisp
+;;; A Storage Base represents a physical storage resource such as a
+;;; register set or stack frame. Storage bases for non-global
+;;; resources such as the stack are relativized by the environment
+;;; that the TN is allocated in. Packing conflict information is kept
+;;; in the storage base, but non-packed storage resources such as
+;;; closure environments also have storage bases.
+;;;
+;;; Some storage bases:
+;;;     General purpose registers
+;;;     Floating point registers
+;;;     Boxed (control) stack environment
+;;;     Unboxed (number) stack environment
+;;;     Closure environment
+#+END_SRC
+
+** Storage bases in x86-64 (from file:src/compiler/x86-64/vm.lisp):
+
+*** Registers
+
+*** Floating-point registers
+
+*** Stack
+
+*** TODO Constants
+
+*** Immediate constants
+
+*** Noise
+
+Seems to be a placeholder for stuff to be ignored.
+
+** From file:src/compiler/meta-vmdef.lisp:
+
+*** Storage bases take a name, a kind (one of =:finite=, =:unbounded= or =:non-packed=), and a size (in bytes). If the kind is finite, the size is the total size, if it is unbounded then size holds the initially allocated size.
+
+* Storage classes (SCs):
+
+** From file:src/compiler/vop.lisp:
+
+#+BEGIN_SRC lisp
+;;; A storage class is a potentially arbitrary set of the elements in
+;;; a storage base. Although conceptually there may be a hierarchy of
+;;; storage classes such as "all registers", "boxed registers", "boxed
+;;; scratch registers", this doesn't exist at the implementation
+;;; level. Such things can be done by specifying storage classes whose
+;;; locations overlap. A TN shouldn't have lots of overlapping SC's as
+;;; legal SC's, since time would be wasted repeatedly attempting to
+;;; pack in the same locations.
+#+END_SRC
+
+** From file:src/compiler/meta-vmdef.lisp:
+
+*** Storage classes:
+
+| Name              | Type                     | Description                                                                                     |
+|-------------------+--------------------------+-------------------------------------------------------------------------------------------------|
+| name              | symbol                   | name of SC                                                                                      |
+| number            | sc-number (integer 0 62) | number used to index SC cost vectors                                                            |
+| sb                | (or storage-base null)   | storage base                                                                                    |
+| element-size      | index                    | size of elements in SC                                                                          |
+| locations         | sc-locations             | vector of locations in SC if SB is finite                                                       |
+| operand-size      | (or keyword null)        | information for the assembler                                                                   |
+| alternate-scs     | list                     | list of alternate (save) SCs for this SC                                                        |
+| constant-scs      | list                     | list of constant SCs that can be moved into SC                                                  |
+| save-p            | boolean                  | true if the values in this SC must be saved across calls                                        |
+| move-funs         | array of sc-vector       | vectors mapping from SC numbers to information about how to load from the index SC to this one. |
+| load-costs        | array of sc-vector       | see above                                                                                       |
+| move-vops         | array of sc-vector       |                                                                                                 |
+| move-costs        |                          |                                                                                                 |
+| move-arg-vops     |                          |                                                                                                 |
+| number-stack-p    | boolean                  | true if SC is in the NUMBER-STACK SB                                                            |
+| alignment         | (and index (integer 1))  | alignment restriction                                                                           |
+| reserve-locations | sc-locations             | vector of locations where packing should be avoided                                             |
+
+*** Name
+
+*** Number
+
+*** Storage base
+
+*** Element size (number of elements in the SC)
+
+*** Locations (vector of locations)
+
+** Descriptor and non-descriptor registers.
+
+Descriptor registers seem to be those that can contain references to heap-allocated data.
+
+** Storage classes in x86-64 (from file:src/compiler/x86-64/vm.lisp):
+
+*** Constants
+
+**** FP single or double zero (complex or real).
+
+**** FP single or double immediate (complex or real).
+
+**** SIMD (packed) registers.
+
+*** Stacks
+
+**** Control stack (scanned by GC).
+
+**** Non-descriptor stacks:
+
+***** TODO Signed and unsigned stacks.
+
+***** TODO Character stacks.
+
+***** System area pointer stack.
+
+***** FP single or double (real or complex) stacks.
+
+***** SIMD stacks.
+
+*** Registers.
+
+**** Storage classes overlapping with RAX, RCX, RDX, RBX, RSP, RBP, RSI, RDI, R8, R9, R10, R11, R12, R13, R14, and R15.
+
+***** Immediate descriptor registers (no need to be scanned by the GC).
+
+***** Descriptor registers (pointer descriptor objects that must be scanned by the GC).
+
+***** Character registers
+
+***** SAP registers
+
+***** Signed and unsigned registers.
+
+**** Storage classes overlapping with floating point registers.
+
+***** Single and double precision (real and imaginary) registers (for one FP number).
+
+**** SIMD / AVX registers.
+
+** Temporary register for assembly routines: R11.
+
+** Temporary names for registers used to pass arguments.
+
+*** Defined by =*register-arg-names*= in file:src/compiler/x86-64/vm.lisp
+
+** Temporary register for "thread base": R13.
+
+*** Thread base is the register holding the base address for the current thread's thread-local storage (TLS). Used by functions such as =thread-tls-ea=.
+
+* file:src/compiler/meta-vmdef.lisp
+
+** Provides implementation-independent code to define the VM. In particular, macros to define storage bases and storage classes.
+
+* file:src/compiler/vmdef.lisp
+
+* file:src/compiler/x86-64/vm.lisp

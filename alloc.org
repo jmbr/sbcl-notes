@@ -1,0 +1,5 @@
+#+TITLE: Memory allocation from the Lisp side
+#+CATEGORY: Memory management
+#+STARTUP: showall
+
+* The function =allocation= in file:src/compiler/x86-64/alloc.lisp is called from the VOPs in the code generator.
