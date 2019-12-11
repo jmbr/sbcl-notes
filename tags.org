@@ -103,7 +103,47 @@ struct ratio {
 #define RATIO_DENOMINATOR_OFFSET 1
 #+END_SRC
 
-1 * 8 - 
+The appearance of a =header= lispobj in the structure is a consequence of the =ratio= object having a widetag. To get the offsets of the fields, we proceed as before:
+
+| SLOT-OFFSET | N-WORD-BYTES | LOWTAG                    | Result                       |
+|-------------+--------------+---------------------------+------------------------------|
+|           1 |            8 | OTHER_POINTER_LOWTAG = 15 | RATIO_NUMERATOR_OFFSET = -7  |
+|           2 |            8 | OTHER_POINTER_LOWTAG = 15 | RATIO_DENOMINATOR_OFFSET = 1 |
+
+* The list of all primitive object structures can be found at runtime in =sb-vm:*primitive-objects*=.
+
+* Primitive objects having a widetag:
+
+array
+bignum
+complex
+double-float
+ratio
+sb-kernel:closure
+sb-kernel:complex-double-float
+sb-kernel:complex-single-float
+sb-kernel:fdefn
+sb-kernel:funcallable-instance
+sb-kernel:instance
+sb-kernel:simple-fun
+sb-vm::code
+sb-vm::sap
+sb-vm::value-cell
+simd-pack
+simd-pack-256
+symbol
+vector
+weak-pointer
+
+* Primitive objects without a widetag:
+
+cons
+sb-c:catch-block
+sb-c:unwind-block
+sb-vm::binding
+sb-vm::thread
+
+* The function =write-primitive-object= in file:src/compiler/generic/genesis.lisp generates the header files that allow the C runtime to interface with primitive objects directly.
 
 * The code in src/runtime/print.c provides good examples on how to interpret tags.
 
