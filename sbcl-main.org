@@ -135,7 +135,7 @@ the values of scan_start_offset_ and bytes_used_ are zero for the sentinel.
 
 an array of page structures allows SBCL to map between an address and its page structure
 
-**** weabobj_init()
+**** weakobj_init()
 
 ***** hopscotch_init()
 
