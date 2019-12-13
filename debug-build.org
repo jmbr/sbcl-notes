@@ -1,6 +1,7 @@
 #+BEGIN_SRC bash
 sh make.sh --fancy \
            --with-sb-after-xc-core \
+           --with-sb-devel \
            --with-sb-dynamic-core \
            --with-sb-fasteval \
            --with-sb-fluid \
